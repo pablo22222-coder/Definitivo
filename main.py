@@ -6,6 +6,7 @@
 # Mejora 21 (fail-safe último recurso): si ocurre una excepción crítica se devuelven
 # resultados parciales ya procesados en lugar de error global. Esto se ejecuta SOLO
 # como ÚLTIMO RECURSO (try/except envolvente en get_domains_from_prompt).
+
 import os
 import re
 import time
@@ -47,8 +48,9 @@ except Exception:
     idna = None
 
 # Optional libs (graceful fallback)
+# NOTE: we intentionally neutralize whois support below to remove whois functionality.
 try:
-    import whois as whois_lib
+    import whois as whois_lib  # tried but we'll override to disable whois below
 except Exception:
     whois_lib = None
 
@@ -56,6 +58,10 @@ try:
     import tldextract
 except Exception:
     tldextract = None
+
+# Disable whois entirely (user requested removal of whois functionality)
+# keep variable present but set to None so code paths that check `if whois_lib: ...` won't run.
+whois_lib = None
 
 # NLP optional
 try:
@@ -113,8 +119,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
 ]
 HEADERS_BASE = {"Accept-Language": "es-ES,es;q=0.9,en;q=0.8", "Connection": "keep-alive", "Cache-Control": "no-cache"}
-DEFAULT_TIMEOUT = int(os.environ.get("DEFAULT_TIMEOUT", "8"))
-HEAD_TIMEOUT = int(os.environ.get("HEAD_TIMEOUT", "4"))
+# DEFAULT_TIMEOUT used para GETs largos; acepta float
+DEFAULT_TIMEOUT = float(os.environ.get("DEFAULT_TIMEOUT", "8.0"))
+# HEAD_TIMEOUT (usado por head checks)
+HEAD_TIMEOUT = float(os.environ.get("HEAD_TIMEOUT", "4.0"))
 JITTER_BETWEEN_QUERIES = (float(os.environ.get("JITTER_MIN", "1.0")), float(os.environ.get("JITTER_MAX", "3.0")))
 JITTER_BETWEEN_PAGES = (float(os.environ.get("P_MIN", "0.2")), float(os.environ.get("P_MAX", "0.8"))) if False else (float(os.environ.get("JITTER_P_MIN", "0.2")), float(os.environ.get("JITTER_P_MAX", "0.8")))
 MAX_BACKOFF = int(os.environ.get("MAX_BACKOFF", "600"))
@@ -207,7 +215,7 @@ BACKPRESSURE_CHECK_SLEEP = float(os.environ.get("BACKPRESSURE_CHECK_SLEEP", "1.0
 DEGRADED_MAX_DOMAINS = int(os.environ.get("DEGRADED_MAX_DOMAINS", "40"))
 DEGRADED_RELAX_QUALITY = int(os.environ.get("DEGRADED_RELAX_QUALITY", "15"))  # reduce quality target
 DEGRADED_SEARCH_RESULTS_PER_QUERY = int(os.environ.get("DEGRADED_SEARCH_RESULTS_PER_QUERY", "20"))
-DEGRADED_SHORT_HEAD_TIMEOUT = float(os.environ.get("DEGRADED_SHORT_HEAD_TIMEOUT", "1.5"))
+DEGRADED_SHORT_HEAD_TIMEOUT = float(os.environ.get("DEGRADED_SHORT_HEAD_TIMEOUT", "1.5"))  # keep as float
 DEGRADED_SHORT_GET_TIMEOUT = float(os.environ.get("DEGRADED_SHORT_GET_TIMEOUT", "2.0"))
 DEGRADED_PREFERRED_ORDER = (os.environ.get("DEGRADED_PREFERRED_ORDER", "ddg,searx,gsearch").split(","))
 
@@ -216,13 +224,31 @@ SEEN_MAX_SIZE = int(os.environ.get("SEEN_MAX_SIZE", "20000"))  # tamaño bounded
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# reduce noisy urllib3 retry logs that clutter terminal (configurable)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # Flask app
 app = Flask(__name__)
 
 # ---------------- HTTP Session with pool & retries ----------------
 SESSION = requests.Session()
-RETRY_STRAT = Retry(total=2, backoff_factor=0.3, status_forcelist=(429, 500, 502, 503, 504))
+
+def _make_retry_strategy():
+    # Conservative retry strategy to avoid lots of reattempt logs and retries on read timeouts.
+    total = int(os.environ.get("REQUESTS_RETRY_TOTAL", "1"))  # default 1 retry
+    backoff = float(os.environ.get("REQUESTS_BACKOFF_FACTOR", "0.2"))
+    status_forcelist = (429, 500, 502, 503, 504)
+    try:
+        # Try using modern signature (allowed_methods)
+        return Retry(total=total, backoff_factor=backoff, status_forcelist=status_forcelist, allowed_methods=frozenset(['GET', 'HEAD']))
+    except TypeError:
+        # Fallback for older urllib3 versions where param is method_whitelist
+        try:
+            return Retry(total=total, backoff_factor=backoff, status_forcelist=status_forcelist, method_whitelist=frozenset(['GET', 'HEAD']))
+        except Exception:
+            return Retry(total=total, backoff_factor=backoff, status_forcelist=status_forcelist)
+
+RETRY_STRAT = _make_retry_strategy()
 ADAPTER = HTTPAdapter(pool_connections=HTTP_CONCURRENCY, pool_maxsize=HTTP_CONCURRENCY, max_retries=RETRY_STRAT)
 SESSION.mount("https://", ADAPTER)
 SESSION.mount("http://", ADAPTER)
@@ -667,7 +693,7 @@ def _fetch_robots_for_host(host: str) -> Optional[robotparser.RobotFileParser]:
         content = None
         for url in candidates:
             try:
-                r = SESSION.request("get", url, headers=rand_headers(), timeout=4, allow_redirects=True, proxies=None)
+                r = SESSION.request("get", url, headers=rand_headers(), timeout=4.0, allow_redirects=True, proxies=None)
                 if r and r.status_code == 200 and r.text:
                     content = r.text
                     try:
@@ -780,7 +806,7 @@ class _SafeResponse:
         return self.status_code is not None
 
 # ---------------- http_request wrapper (con SSRF check + proxy pool + circuit handling + politeness) ----------------
-def http_request(method: str, url: str, timeout: int = DEFAULT_TIMEOUT, allow_redirects: bool = True,
+def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_redirects: bool = True,
                  headers: dict = None, max_retries: int = 3, backoff_base: float = 2.0,
                  ignore_robots: bool = False) -> Optional[_SafeResponse]:
     parsed = None
@@ -871,6 +897,7 @@ def http_request(method: str, url: str, timeout: int = DEFAULT_TIMEOUT, allow_re
 
             try:
                 h = rand_headers(headers or {})
+                # timeout can be float
                 r = SESSION.request(method.upper(), url, headers=h, timeout=timeout, allow_redirects=allow_redirects, proxies=proxies)
                 if r is None:
                     raise requests.exceptions.RequestException("No response")
@@ -1065,8 +1092,7 @@ def tfidf_similarity(a: str, b: str) -> float:
 _http_semaphore = threading.BoundedSemaphore(HTTP_CONCURRENCY)
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# executor dedicated for short whois tasks to avoid blocking main executor
-_whois_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+# NOTE: whois removed by user request; no dedicated whois executor is created.
 
 # ---------------- Fast filter (Capa 0) ----------------
 _suspicious_tlds = { "xyz", "top", "club", "online", "pw", "tk", "loan", "win" }
@@ -1187,7 +1213,7 @@ def fast_filter(prompt: str, domain: str, keywords: Optional[List[str]] = None) 
             for k in keywords:
                 prompt_tokens.update(safe_findall(r"[A-Za-z0-9]{3,}", k.lower()))
         else:
-            prompt_tokens.update(safe_findall(r"[A-Za-z0-9]{3,}", (prompt or "").lower()))
+            prompt_tokens.update(safe_findall(r"[A-Za-zÀ-ÿ0-9]{3,}", (prompt or "").lower()))
         overlap = domain_tokens.intersection(prompt_tokens)
         overlap_score = min(len(overlap) * 6, 30)
         if overlap:
@@ -1266,7 +1292,11 @@ def safe_extract_urls(item, _depth=0, _max_depth=6, _acc=None, _max_urls=200) ->
     return list(dict.fromkeys(u for u in _acc if u))[:_max_urls]
 
 # ---------------- Network-level helpers ----------------
-def domain_alive(domain: str, head_timeout=HEAD_TIMEOUT, get_timeout=DEFAULT_TIMEOUT, retries=2) -> bool:
+def domain_alive(domain: str, head_timeout: float = HEAD_TIMEOUT, get_timeout: float = DEFAULT_TIMEOUT, retries: int = 2) -> bool:
+    """
+    Comprueba rápidamente si el dominio responde con HEAD/GET.
+    Ahora usa timeouts como floats para evitar truncados a 1 segundo.
+    """
     if not domain:
         return False
     schemes = ("https://", "http://")
@@ -1335,7 +1365,8 @@ def domain_alive(domain: str, head_timeout=HEAD_TIMEOUT, get_timeout=DEFAULT_TIM
 
 def domain_alive_short(domain: str) -> bool:
     try:
-        return domain_alive(domain, head_timeout=int(DEGRADED_SHORT_HEAD_TIMEOUT), get_timeout=int(DEGRADED_SHORT_GET_TIMEOUT), retries=0)
+        # do NOT cast to int: keep fractional seconds if present
+        return domain_alive(domain, head_timeout=DEGRADED_SHORT_HEAD_TIMEOUT, get_timeout=DEGRADED_SHORT_GET_TIMEOUT, retries=0)
     except Exception:
         return False
 
@@ -1370,34 +1401,82 @@ def clean_domain_from_url(url: str) -> str:
         return ""
 
 # ---------------- Fetch + heavy_check improvements ----------------
-def fetch_homepage_text(domain: str, timeout: int = 6) -> str:
+def fetch_homepage_text(domain: str, timeout: float = 6.0) -> str:
+    """
+    Fetch homepage text with the following behavior:
+      - If the homepage is <= HOME_MAX_BYTES_TO_FULL_FETCH (500 KB by default), fetch whole page and extract
+        title, meta description, first <p> blocks (like before).
+      - If it is larger, do a lightweight extraction: read only the initial bytes (STREAM_INITIAL_BYTES)
+        and extract:
+         - <title>
+         - <meta name="description">
+         - <meta name="keywords">
+         - <link rel="canonical">
+         - first few <script> and <style> blocks (their signatures / src or small inline content)
+         - <header>, <nav>, and top structural blocks (first <header>, first <nav>, first big <div> at top)
+         - detect main marketing/CMS script srcs (gtm, google-analytics, analytics.js, wp-json, wp-content, /wp-includes/)
+      - Careful with memory: close responses, delete heavy vars, call GC if debug enabled.
+    """
+    HOME_MAX_BYTES_TO_FULL_FETCH = 500 * 1024  # 500 KB
+    STREAM_INITIAL_BYTES = int(os.environ.get("STREAM_INITIAL_BYTES", str(160 * 1024)))  # Default 160 KB to parse top-of-page
+    HEAD_TRY_TIMEOUT = float(os.environ.get("HEAD_TRY_TIMEOUT", str(HEAD_TIMEOUT)))
     try:
-        with _http_semaphore:
-            url = f"https://{domain}/"
-            r = http_request("get", url, timeout=timeout, allow_redirects=True)
-            if not r or r.status_code != 200:
-                if r:
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
-                    try:
-                        del r
-                    except Exception:
-                        pass
-                url = f"http://{domain}/"
-                r = http_request("get", url, timeout=timeout, allow_redirects=True)
-            if r and r.status_code == 200 and r.text:
-                text = r.text
+        url_https = f"https://{domain}/"
+        url_http = f"http://{domain}/"
+
+        # 1) Try HEAD to quickly inspect Content-Length (and keep politeness)
+        head_resp = None
+        try:
+            with _http_semaphore:
+                head_resp = SESSION.request("head", url_https, headers=rand_headers(), timeout=HEAD_TRY_TIMEOUT, allow_redirects=True)
+            if head_resp is None or head_resp.status_code >= 400:
                 try:
-                    r.close()
+                    if head_resp:
+                        head_resp.close()
+                        del head_resp
                 except Exception:
                     pass
-                try:
-                    del r
-                except Exception:
-                    pass
-                soup = BeautifulSoup(text, "html.parser")
+                with _http_semaphore:
+                    head_resp = SESSION.request("head", url_http, headers=rand_headers(), timeout=HEAD_TRY_TIMEOUT, allow_redirects=True)
+        except Exception:
+            # ignore head failures - we'll fallback to GET streaming
+            try:
+                if head_resp:
+                    head_resp.close()
+            except Exception:
+                pass
+            head_resp = None
+
+        content_length = None
+        try:
+            if head_resp and head_resp.headers:
+                cl = head_resp.headers.get("Content-Length") or head_resp.headers.get("content-length")
+                if cl:
+                    try:
+                        content_length = int(cl)
+                    except Exception:
+                        content_length = None
+            try:
+                if head_resp:
+                    head_resp.close()
+            except Exception:
+                pass
+            try:
+                del head_resp
+            except Exception:
+                pass
+        except Exception:
+            content_length = None
+
+        # Decide strategy
+        is_large_by_header = False
+        if content_length is not None and content_length > HOME_MAX_BYTES_TO_FULL_FETCH:
+            is_large_by_header = True
+
+        # Helper to parse full HTML (small pages)
+        def _parse_full_text(html_text: str) -> str:
+            try:
+                soup = BeautifulSoup(html_text, "html.parser")
                 texts = []
                 title = ""
                 try:
@@ -1408,19 +1487,26 @@ def fetch_homepage_text(domain: str, timeout: int = 6) -> str:
                     texts.append(title)
                 m = None
                 try:
-                    m = soup.find("meta", attrs={"name": "description"})
+                    # meta name=description (case-insensitive)
+                    m = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
                 except Exception:
                     m = None
                 if m and m.get("content"):
                     texts.append(m.get("content").strip())
+                # if meta keywords present
+                mk = None
+                try:
+                    mk = soup.find("meta", attrs={"name": re.compile(r"keywords", re.I)})
+                except Exception:
+                    mk = None
+                if mk and mk.get("content"):
+                    texts.append(mk.get("content").strip())
                 ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")][:8]
                 texts.extend([p for p in ps if p])
                 if not texts:
                     texts.append(soup.get_text(" ", strip=True)[:4000])
                 result = " ".join(texts)[:20000]
-                # cleanup heavy objects ASAP
                 try:
-                    # BeautifulSoup has decompose to release memory
                     if hasattr(soup, "decompose"):
                         try:
                             soup.decompose()
@@ -1429,72 +1515,377 @@ def fetch_homepage_text(domain: str, timeout: int = 6) -> str:
                     del soup
                 except Exception:
                     pass
-                try:
-                    del text
-                except Exception:
-                    pass
-                try:
-                    del texts, ps, title, m
-                except Exception:
-                    pass
                 _maybe_collect()
                 return result
-            if r:
+            except Exception as e:
+                logging.debug("Full-parse failed for %s: %s", domain, e)
+                return ""
+
+        # Helper to parse top-of-page partial HTML for prioritized tags
+        def _parse_top_partial(html_bytes: bytes) -> str:
+            try:
+                html_text = html_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                html_text = html_bytes.decode("latin-1", errors="replace") if html_bytes else ""
+            try:
+                soup = BeautifulSoup(html_text, "html.parser")
+            except Exception:
+                # fallback: regex-ish extraction
+                soup = None
+
+            extracted = []
+            # title
+            try:
+                if soup and soup.title and soup.title.string:
+                    extracted.append(soup.title.string.strip())
+                else:
+                    m = safe_search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.I | re.S, max_len=len(html_text))
+                    if m:
+                        extracted.append(m.group(1).strip())
+            except Exception:
+                pass
+
+            # meta description & keywords
+            try:
+                if soup:
+                    md = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
+                    if md and md.get("content"):
+                        extracted.append(md.get("content").strip())
+                    mk = soup.find("meta", attrs={"name": re.compile(r"keywords", re.I)})
+                    if mk and mk.get("content"):
+                        extracted.append(mk.get("content").strip())
+                else:
+                    m = safe_search(r'<meta[^>]+name=["\']?description["\']?[^>]*content=["\'](.*?)["\']', html_text, flags=re.I | re.S, max_len=len(html_text))
+                    if m:
+                        extracted.append(m.group(1).strip())
+                    mk = safe_search(r'<meta[^>]+name=["\']?keywords["\']?[^>]*content=["\'](.*?)["\']', html_text, flags=re.I | re.S, max_len=len(html_text))
+                    if mk:
+                        extracted.append(mk.group(1).strip())
+            except Exception:
+                pass
+
+            # canonical link
+            try:
+                if soup:
+                    can = soup.find("link", attrs={"rel": re.compile(r"canonical", re.I)})
+                    if can and can.get("href"):
+                        extracted.append(can.get("href").strip())
+                else:
+                    m = safe_search(r'<link[^>]+rel=["\']?canonical["\']?[^>]*href=["\'](.*?)["\']', html_text, flags=re.I | re.S, max_len=len(html_text))
+                    if m:
+                        extracted.append(m.group(1).strip())
+            except Exception:
+                pass
+
+            # header / nav / top structure
+            try:
+                top_bits = []
+                if soup:
+                    header = soup.find("header")
+                    if header:
+                        top_bits.append(header.get_text(" ", strip=True)[:1200])
+                    nav = soup.find("nav")
+                    if nav:
+                        top_bits.append(nav.get_text(" ", strip=True)[:1200])
+                    # if no header/nav, try first big div near top
+                    if not top_bits:
+                        first_div = soup.find("div")
+                        if first_div:
+                            top_bits.append(first_div.get_text(" ", strip=True)[:1200])
+                else:
+                    # simple regex extraction of first <header> or <nav> content
+                    m = safe_search(r"<header.*?>(.*?)</header>", html_text, flags=re.I | re.S, max_len=len(html_text))
+                    if m:
+                        top_bits.append(re.sub(r"\s+", " ", m.group(1)).strip()[:1200])
+                    m2 = safe_search(r"<nav.*?>(.*?)</nav>", html_text, flags=re.I | re.S, max_len=len(html_text))
+                    if m2:
+                        top_bits.append(re.sub(r"\s+", " ", m2.group(1)).strip()[:1200])
+                    if not top_bits:
+                        m3 = safe_search(r"<div.*?>(.*?)</div>", html_text, flags=re.I | re.S, max_len=len(html_text))
+                        if m3:
+                            top_bits.append(re.sub(r"\s+", " ", m3.group(1)).strip()[:1200])
+                if top_bits:
+                    extracted.extend([t for t in top_bits if t])
+            except Exception:
+                pass
+
+            # gather first script/style blocks signatures: src attributes or inline snippet up to small len
+            try:
+                scripts = []
+                styles = []
+                marketing_signals = []
+                if soup:
+                    # scripts
+                    for idx, s in enumerate(soup.find_all("script")[:8]):
+                        src = s.get("src")
+                        if src:
+                            scripts.append(f"SCRIPT_SRC:{src}")
+                            # check for common marketing/CMS hints
+                            if re.search(r"(gtm|google-analytics|analytics|gtag|facebook|fbq|hotjar|segment|mixpanel|matomo|wp-)", src, re.I):
+                                marketing_signals.append(src)
+                        else:
+                            inline = s.get_text(" ", strip=True)[:240]
+                            if inline:
+                                scripts.append(f"SCRIPT_INLINE:{inline}")
+                                if re.search(r"(gtm|google-analytics|analytics|gtag|fbq|hotjar|mixpanel|matomo|wp-)", inline, re.I):
+                                    marketing_signals.append(inline[:200])
+                    # styles
+                    for idx, st in enumerate(soup.find_all("style")[:4]):
+                        inline = st.get_text(" ", strip=True)[:400]
+                        if inline:
+                            styles.append(inline)
+                else:
+                    # regex fallback
+                    for m in re.finditer(r'<script[^>]*\ssrc=["\'](.*?)["\']', html_text, flags=re.I):
+                        src = m.group(1)
+                        scripts.append(f"SCRIPT_SRC:{src}")
+                        if re.search(r"(gtm|google-analytics|analytics|gtag|facebook|fbq|hotjar|segment|mixpanel|matomo|wp-)", src, re.I):
+                            marketing_signals.append(src)
+                    # inline scripts
+                    for m in re.finditer(r'<script[^>]*>(.*?)</script>', html_text, flags=re.I | re.S):
+                        inline = re.sub(r"\s+", " ", m.group(1)).strip()[:240]
+                        if inline:
+                            scripts.append(f"SCRIPT_INLINE:{inline}")
+                            if re.search(r"(gtm|google-analytics|analytics|gtag|fbq|hotjar|mixpanel|matomo|wp-)", inline, re.I):
+                                marketing_signals.append(inline[:200])
+                    for m in re.finditer(r'<style[^>]*>(.*?)</style>', html_text, flags=re.I | re.S):
+                        st = re.sub(r"\s+", " ", m.group(1)).strip()[:400]
+                        if st:
+                            styles.append(st)
+                if scripts:
+                    extracted.append(" | ".join(scripts[:6]))
+                if styles:
+                    extracted.append("STYLE_SNIPPETS:" + (" | ".join(styles[:3]) if styles else ""))
+                if marketing_signals:
+                    extracted.append("MARKETING_SIGNALS:" + (" | ".join(marketing_signals[:6])))
+            except Exception:
+                pass
+
+            # fallback: if no extracted text, take a small plain-text snippet
+            if not extracted:
                 try:
+                    snippet = re.sub(r"\s+", " ", html_text)[:1200]
+                    if snippet:
+                        extracted.append(snippet)
+                except Exception:
+                    pass
+
+            try:
+                if soup and hasattr(soup, "decompose"):
+                    try:
+                        soup.decompose()
+                    except Exception:
+                        pass
+                    del soup
+            except Exception:
+                pass
+            _maybe_collect()
+            return " ".join([e for e in extracted if e])[:20000]
+
+        # If header indicated small page => fetch fully (allowed)
+        if not is_large_by_header:
+            # attempt full GET (https first, fallback to http)
+            try:
+                with _http_semaphore:
+                    r = http_request("get", url_https, timeout=timeout, allow_redirects=True)
+                if r is None or r.status_code != 200 or not r.text:
+                    try:
+                        if r:
+                            r.close()
+                    except Exception:
+                        pass
+                    with _http_semaphore:
+                        r = http_request("get", url_http, timeout=timeout, allow_redirects=True)
+                if r and r.status_code == 200 and r.text:
+                    text = r.text
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    try:
+                        del r
+                    except Exception:
+                        pass
+                    res = _parse_full_text(text)
+                    try:
+                        del text
+                    except Exception:
+                        pass
+                    _maybe_collect()
+                    return res
+                if r:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    try:
+                        del r
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.debug("fetch_homepage_text full-get failed for %s: %s", domain, e)
+                # continue to streaming fallback below
+
+        # If we reach here -> either header said large or GET full failed; do streaming partial read
+        try:
+            # prefer https streaming
+            with _http_semaphore:
+                # use session.request directly to get streaming; reuse rand_headers
+                h = rand_headers()
+                r = SESSION.request("get", url_https, headers=h, timeout=timeout, stream=True, allow_redirects=True)
+                if r is None or r.status_code >= 400:
+                    try:
+                        if r:
+                            r.close()
+                    except Exception:
+                        pass
+                    with _http_semaphore:
+                        r = SESSION.request("get", url_http, headers=h, timeout=timeout, stream=True, allow_redirects=True)
+        except Exception as e:
+            logging.debug("fetch_homepage_text streaming GET failed for %s: %s", domain, e)
+            try:
+                if r:
                     r.close()
-                except Exception:
-                    pass
+            except Exception:
+                pass
+            # final fallback: return empty
+            return ""
+
+        if not r:
+            return ""
+
+        # If Content-Length known and > limit, we will early-stop and parse initial chunk
+        total_read = 0
+        chunks = []
+        try:
+            cl_header = r.headers.get("Content-Length")
+            if cl_header:
                 try:
-                    del r
+                    clv = int(cl_header)
+                    if clv > HOME_MAX_BYTES_TO_FULL_FETCH:
+                        # large - only read initial STREAM_INITIAL_BYTES
+                        to_read_limit = STREAM_INITIAL_BYTES
+                    else:
+                        to_read_limit = clv + 1024  # read full if small
+                except Exception:
+                    to_read_limit = STREAM_INITIAL_BYTES
+            else:
+                # unknown size: read up to HOME_MAX_BYTES_TO_FULL_FETCH + 1 to detect large
+                to_read_limit = HOME_MAX_BYTES_TO_FULL_FETCH + 1
+
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total_read += len(chunk)
+                # stop if we've read enough to decide
+                if total_read >= to_read_limit:
+                    break
+            initial_bytes = b"".join(chunks)
+            # If content-length header existed and less than limit we might have only read part - attempt to read rest only if small
+            is_large_stream_detected = False
+            if cl_header:
+                try:
+                    if int(cl_header) > HOME_MAX_BYTES_TO_FULL_FETCH:
+                        is_large_stream_detected = True
                 except Exception:
                     pass
-                _maybe_collect()
+            else:
+                # if we read more than the HOME_MAX_BYTES threshold => treat as large
+                if total_read > HOME_MAX_BYTES_TO_FULL_FETCH:
+                    is_large_stream_detected = True
+
+            # If page is small (we read everything or header told small), attempt to fetch full page text via http_request to reuse parsing path
+            if not is_large_stream_detected:
+                # try obtain full text through normal http_request (non-stream) which handles decodings and nice parsing
+                try:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    with _http_semaphore:
+                        full_r = http_request("get", url_https, timeout=timeout, allow_redirects=True)
+                    if full_r is None or full_r.status_code != 200 or not full_r.text:
+                        try:
+                            if full_r:
+                                full_r.close()
+                        except Exception:
+                            pass
+                        with _http_semaphore:
+                            full_r = http_request("get", url_http, timeout=timeout, allow_redirects=True)
+                    if full_r and full_r.status_code == 200 and full_r.text:
+                        text = full_r.text
+                        try:
+                            full_r.close()
+                        except Exception:
+                            pass
+                        try:
+                            del full_r
+                        except Exception:
+                            pass
+                        res = _parse_full_text(text)
+                        try:
+                            del text
+                        except Exception:
+                            pass
+                        _maybe_collect()
+                        return res
+                    if full_r:
+                        try:
+                            full_r.close()
+                        except Exception:
+                            pass
+                        try:
+                            del full_r
+                        except Exception:
+                            pass
+                except Exception:
+                    # If full fetch fails, fall through to partial parsing of initial_bytes
+                    pass
+
+            # For large pages: parse only the initial_bytes using partial parser
+            res = _parse_top_partial(initial_bytes)
+            try:
+                r.close()
+            except Exception:
+                pass
+            try:
+                del r
+            except Exception:
+                pass
+            try:
+                del chunks, initial_bytes
+            except Exception:
+                pass
+            _maybe_collect()
+            return res
+        except Exception as e:
+            logging.debug("fetch_homepage_text streaming parse error for %s: %s", domain, e)
+            try:
+                if r:
+                    r.close()
+            except Exception:
+                pass
+            try:
+                del r
+            except Exception:
+                pass
+            _maybe_collect()
+            return ""
     except Exception as e:
         logging.debug("fetch_homepage_text error %s: %s", domain, e)
     return ""
 
-# ---------------- whois seguro (async + timeout) ----------------
-def _whois_lookup(domain: str):
-    try:
-        if not whois_lib:
-            return None
-        return whois_lib.whois(domain)
-    except Exception as e:
-        logging.debug("whois lookup failed for %s: %s", domain, e)
-        return None
-
+# ---------------- whois removed / stubbed (user requested whois elimination) ----------------
 def get_domain_age_months(domain: str) -> Optional[int]:
-    if not whois_lib:
-        return None
-    try:
-        fut = _whois_executor.submit(_whois_lookup, domain)
-        try:
-            info = fut.result(timeout=4.0)
-        except concurrent.futures.TimeoutError:
-            try:
-                fut.cancel()
-            except Exception:
-                pass
-            logging.debug("whois timed out for %s", domain)
-            return None
-        if not info:
-            return None
-        cd = info.get("creation_date") if isinstance(info, dict) else getattr(info, "creation_date", None)
-        if not cd:
-            return None
-        if isinstance(cd, list):
-            cd = cd[0]
-        if not hasattr(cd, "year"):
-            return None
-        years = time.gmtime().tm_year - cd.year
-        months = years * 12 + max(0, getattr(cd, "month", 1) - 1)
-        return int(months)
-    except Exception as e:
-        logging.debug("get_domain_age_months error %s: %s", domain, e)
-        return None
+    """
+    Whois functionality has been removed per user request.
+    Keep a safe stub that returns None so callers remain compatible.
+    """
+    return None
 
 # ---------------- ASSESS + HEAVY CHECK (REFACTORED) ----------------
-def assess_domain_quality_quick(domain: str, timeout: int = 6) -> Tuple[int, List[str]]:
+def assess_domain_quality_quick(domain: str, timeout: float = 6.0) -> Tuple[int, List[str]]:
     """
     Versión más rápida y segura de assess_domain_quality; diseñada para ejecutarse como subtarea.
     """
@@ -1572,7 +1963,7 @@ def assess_domain_quality_quick(domain: str, timeout: int = 6) -> Tuple[int, Lis
     _maybe_collect()
     return int(score), reasons
 
-# Subtask timeouts (ajustables por entorno)
+# Subtask timeouts (ajustables por entorno) - ahora floats
 SUBTASK_TIMEOUTS = {
     "whois": 4.0,
     "fetch_text": 6.0,
@@ -1583,6 +1974,7 @@ SUBTASK_TIMEOUTS = {
 def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) -> Dict:
     """
     Heavy check refactorizado:
+      - aplica HEAD-gate estricto al inicio: si domain_alive_short falla, retornamos rápido (no GETs)
       - divide la comprobación en subtareas independientes con timeouts individuales
       - agrega heurística para no marcar error por lentitud: si al menos una subtarea aporta datos usamos eso
       - devuelve siempre dentro de un tiempo razonable (gestiona timeouts internamente)
@@ -1592,10 +1984,31 @@ def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) ->
     subtask_results = {"whois": None, "fetch_text": None, "assess_quick": None, "head_ok": None}
     subtask_successes = 0
 
+    # ---------- HEAD-GATE: primer paso antes de cualquier GET pesado ----------
+    try:
+        try:
+            head_ok = domain_alive_short(domain)
+        except Exception:
+            head_ok = False
+        if not head_ok:
+            logging.info("heavy_check: head-gate failed for %s — returning low confidence", domain)
+            try:
+                _domain_mark_failure(domain, err="head_gate_failed")
+            except Exception:
+                pass
+            elapsed = time.time() - start
+            return {"score": 10, "reasons": ["head-gate-failed"], "verdict": "reject", "elapsed": elapsed}
+        else:
+            subtask_results["head_ok"] = True
+            subtask_successes += 1
+            reasons.append("head-gate OK")
+    except Exception as e:
+        logging.debug("heavy_check head-gate exception for %s: %s", domain, e)
+
     # Executor local con pocos hilos para correr subtareas (no bloquear el pool global)
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as exec_local:
         futures = {}
-        # whois
+        # whois - will not be scheduled because whois_lib is disabled (see above)
         if whois_lib:
             futures["whois"] = exec_local.submit(get_domain_age_months, domain)
         else:
@@ -1606,9 +2019,6 @@ def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) ->
 
         # assess quick (tries GET and analyzes)
         futures["assess_quick"] = exec_local.submit(assess_domain_quality_quick, domain, SUBTASK_TIMEOUTS["assess_quick"])
-
-        # small head check to see if alive fast
-        futures["head_check"] = exec_local.submit(domain_alive_short, domain)
 
         # collect results with timebox
         for key, fut in list(futures.items()):
@@ -1631,11 +2041,8 @@ def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) ->
                 elif key == "assess_quick":
                     if isinstance(res, tuple) and res[0] is not None:
                         subtask_successes += 1
-                        reasons.extend(res[1][:3])
-                elif key == "head_check":
-                    if res:
-                        subtask_successes += 1
-                        reasons.append("head-check OK")
+                        sub_reasons = res[1] if isinstance(res[1], list) else []
+                        reasons.extend(sub_reasons[:3])
             except concurrent.futures.TimeoutError:
                 reasons.append(f"subtask-timeout:{key}")
                 logging.debug("heavy_check subtask timeout %s for %s", key, domain)
@@ -1675,7 +2082,7 @@ def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) ->
                 except Exception:
                     pass
                 _maybe_collect()
-        # whois age bonus
+        # whois age bonus (stub returns None)
         whois_age = subtask_results.get("whois")
         if isinstance(whois_age, int):
             if whois_age >= 60:
@@ -1683,7 +2090,7 @@ def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) ->
             elif whois_age >= 12:
                 score = min(100, score + 4)
         # head ok bonus
-        if subtask_results.get("head_check"):
+        if subtask_results.get("head_ok"):
             score = min(100, score + 6)
     except Exception as e:
         logging.debug("heavy_check aggregation error: %s", e)
@@ -2361,6 +2768,28 @@ def get_domains_from_prompt(prompt: str,
                                 pass
                             continue
                         _ensure_domain_budget(dom)
+
+                        # ---------- HEAD-GATE (estricto) antes de encolar heavy_check ----------
+                        # Ejecutar domain_alive_short() antes de encolar cualquier GET pesado.
+                        # Si falla -> no encolamos heavy_check (bajamos prioridad / penalizamos).
+                        try:
+                            head_ok = False
+                            try:
+                                head_ok = domain_alive_short(dom)
+                            except Exception:
+                                head_ok = False
+                            if not head_ok:
+                                logging.info("HEAD-gate failed for %s — skipping heavy_check and penalizing slightly", dom)
+                                try:
+                                    _decrement_domain_retry_budget(dom)
+                                except Exception:
+                                    pass
+                                # Guardamos como candidato de baja calidad en maybe_candidates (no encolamos)
+                                maybe_candidates[dom] = {"domain": dom, "quality": 15, "reasons": ["head-gate-failed"], "source_engine": src}
+                                continue
+                        except Exception:
+                            logging.debug("Error running HEAD-gate for %s; proceeding cautiously", dom)
+
                         # Submit heavy_check that is now safe/timeboxed internally (returns quickly even si subtasks timeout)
                         future = _executor.submit(heavy_check, prompt, dom, keywords)
                         futures[future] = (dom, src)
@@ -2370,18 +2799,18 @@ def get_domains_from_prompt(prompt: str,
 
             for future, (dom, src) in list(futures.items()):
                 try:
-                    # heavy_check is designed to finish within HEAVY_TIMEOUT_SECS; keep the guard
+                    # heavy_check es diseñado para terminar dentro de HEAVY_TIMEOUT_SECS; guardia extra aquí
                     res = future.result(timeout=max(HEAVY_TIMEOUT_SECS, 6))
                     verdict = res.get("verdict")
                     score = int(res.get("score", 0))
                     reasons = res.get("reasons", [])
-                    # If heavy_check reported no subtasks succeeded -> mark failure for domain (circuit bookkeeping)
+                    # If heavy_check reported no subtasksSucceeded -> mark failure for domain (circuit bookkeeping)
                     try:
                         if any("No subtasks succeeded" in r for r in reasons):
                             _domain_mark_failure(dom, err="heavy_no_subtasks")
                         else:
                             # If score good or head ok, mark success (reset counters)
-                            if score >= QUALITY_ACCEPT or any("head-check OK" in r for r in reasons) or any("fetched homepage text" in r for r in reasons):
+                            if score >= QUALITY_ACCEPT or any("head-gate OK" in r for r in reasons) or any("fetched homepage text" in r for r in reasons):
                                 _domain_mark_success(dom)
                     except Exception:
                         pass
