@@ -1,12 +1,40 @@
-requests
-Flask
-beautifulsoup4
-tldextract
-python-whois
-ddgs
-duckduckgo-search
-googlesearch-python
-scikit-learn
-numpy
-scipy
-scikit-learn
+# Python >= 3.9 recommended
+
+# Core HTTP / scraping / parsing
+requests>=2.28,<3
+urllib3>=1.26,<2
+
+beautifulsoup4>=4.11.1
+lxml>=4.9.1            # opcional: parser más rápido para BeautifulSoup
+
+# Flask web UI
+Flask>=2.2,<3
+
+# Search backends (ddgs preferred, duckduckgo_search fallback)
+ddgs>=0.5.8            # proporciona "from ddgs import DDGS"
+duckduckgo_search>=2.8.2  # alternativa/tener como respaldo
+
+# Google search wrapper (opcional, si quieres usar googlesearch)
+googlesearch-python>=1.0.0  # nombre común para "from googlesearch import search"
+# Si tu proyecto usa otra implementación, comenta/desactiva la línea anterior.
+
+# Utilities
+tldextract>=3.4.0
+idna>=3.4
+
+# ML / text similarity (opcional - tfidf fallback por tokens implementado)
+scikit-learn>=1.2.2
+numpy>=1.24.0
+
+# NLP (opcional: spaCy, se intentan cargar modelos en runtime)
+spacy>=3.5.0
+
+# Concurrency / production server
+gunicorn>=20.1.0
+
+# Dev / ops (opcionales)
+python-dotenv>=0.21.0
+
+# Notes / optional packages (uncomment if you need them)
+# python-whois>=0.7.3   # NOTA: en tu main.py has deshabilitado whois explícitamente
+# ddg==duckduckgo-search alias conflicts may exist; keep both ddgs and duckduckgo_search if you want both implementations.
