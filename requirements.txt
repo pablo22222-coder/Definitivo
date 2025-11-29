@@ -1,0 +1,12 @@
+requests
+Flask
+beautifulsoup4
+tldextract
+python-whois
+ddgs
+duckduckgo-search
+googlesearch-python
+scikit-learn
+numpy
+scipy
+scikit-learn
