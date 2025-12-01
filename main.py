@@ -1,12 +1,9 @@
-# main.py - Domain-only search app (prompt -> queries -> domains)
-# Versión corregida: heavy_check subdividido en subtareas con timeouts individuales
-# y heurística que evita marcar dominio como error por simplemente lento.
-# Mejora 16: Circuit-breaker por dominio (no sólo por proxy/engine)
-# Mejora 18: Protección ante fugas por objetos grandes (limpiar referencias)
-# Mejora 21 (fail-safe último recurso): si ocurre una excepción crítica se devuelven
-# resultados parciales ya procesados en lugar de error global. Esto se ejecuta SOLO
-# como ÚLTIMO RECURSO (try/except envolvente en get_domains_from_prompt).
-
+# -*- coding: utf-8 -*-
+"""
+main.py - Domain-only search app (prompt -> queries -> domains)
+Versión con protección contra ReDoS, límite de prompt (5000), rechazo de "palabras gigantes",
+y demás mejoras integradas y coordinadas.
+"""
 import os
 import re
 import time
@@ -23,23 +20,12 @@ import functools
 import urllib.robotparser as robotparser
 from datetime import timedelta
 import collections
-import gc
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from flask import Flask, request, render_template_string, Response, jsonify
-
-# Leak protection / debug GC
-LEAK_PROTECT_DEBUG = os.environ.get("LEAK_PROTECT_DEBUG", "false").lower() in ("1", "true", "yes")
-
-def _maybe_collect():
-    if LEAK_PROTECT_DEBUG:
-        try:
-            gc.collect()
-        except Exception:
-            pass
 
 # optional idna (punycode) - fallback safe behavior if falta
 try:
@@ -48,9 +34,14 @@ except Exception:
     idna = None
 
 # Optional libs (graceful fallback)
-# NOTE: we intentionally neutralize whois support below to remove whois functionality.
 try:
-    import whois as whois_lib  # tried but we'll override to disable whois below
+    import whois as whois_lib
+    try:
+        logging.getLogger("whois").setLevel(logging.CRITICAL)
+        logging.getLogger("whois.whois").setLevel(logging.CRITICAL)
+        logging.getLogger("whois").propagate = False
+    except Exception:
+        pass
 except Exception:
     whois_lib = None
 
@@ -58,10 +49,6 @@ try:
     import tldextract
 except Exception:
     tldextract = None
-
-# Disable whois entirely (user requested removal of whois functionality)
-# keep variable present but set to None so code paths that check `if whois_lib: ...` won't run.
-whois_lib = None
 
 # NLP optional
 try:
@@ -86,7 +73,7 @@ try:
 except Exception:
     _TFIDF_OK = False
 
-# Search backends detection (se mantienen tal cual)
+# Search backends detection
 _GSEARCH_OK = False
 try:
     from googlesearch import search as gsearch_func
@@ -119,12 +106,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
 ]
 HEADERS_BASE = {"Accept-Language": "es-ES,es;q=0.9,en;q=0.8", "Connection": "keep-alive", "Cache-Control": "no-cache"}
-# DEFAULT_TIMEOUT used para GETs largos; acepta float
-DEFAULT_TIMEOUT = float(os.environ.get("DEFAULT_TIMEOUT", "8.0"))
-# HEAD_TIMEOUT (usado por head checks)
-HEAD_TIMEOUT = float(os.environ.get("HEAD_TIMEOUT", "4.0"))
+DEFAULT_TIMEOUT = int(os.environ.get("DEFAULT_TIMEOUT", "8"))
+HEAD_TIMEOUT = int(os.environ.get("HEAD_TIMEOUT", "4"))
 JITTER_BETWEEN_QUERIES = (float(os.environ.get("JITTER_MIN", "1.0")), float(os.environ.get("JITTER_MAX", "3.0")))
-JITTER_BETWEEN_PAGES = (float(os.environ.get("P_MIN", "0.2")), float(os.environ.get("P_MAX", "0.8"))) if False else (float(os.environ.get("JITTER_P_MIN", "0.2")), float(os.environ.get("JITTER_P_MAX", "0.8")))
+JITTER_BETWEEN_PAGES = (float(os.environ.get("JITTER_P_MIN", "0.2")), float(os.environ.get("JITTER_P_MAX", "0.8")))
 MAX_BACKOFF = int(os.environ.get("MAX_BACKOFF", "600"))
 SEARX_INSTANCES = os.environ.get("SEARX_INSTANCES", "https://searx.tiekoetter.com,https://searx.org").split(",")
 MAX_CYCLES = int(os.environ.get("MAX_CYCLES", "12"))
@@ -201,13 +186,6 @@ DOMAIN_RETRY_BUDGET_DEFAULT = int(os.environ.get("DOMAIN_RETRY_BUDGET", "5"))  #
 _domain_retry_lock = threading.Lock()
 _domain_retry_budget: Dict[str, int] = {}  # map root_domain -> remaining retries
 
-# ---------------- Domain-level circuit-breaker (Mejora 16) ----------------
-DOMAIN_MAX_FAILURES_BEFORE_TRIP = int(os.environ.get("DOMAIN_MAX_FAILURES_BEFORE_TRIP", "4"))
-DOMAIN_COOLDOWN_SECONDS = int(os.environ.get("DOMAIN_COOLDOWN_SECONDS", "300"))  # seconds
-_domain_circuit_lock = threading.Lock()
-# structure: root_domain -> {"failures": int, "last_failure": float, "circuit_open_until": float, "last_error": str}
-_DOMAIN_CIRCUIT: Dict[str, Dict[str, Any]] = {}
-
 # ---------------- Backpressure / degraded-mode config ----------------
 BACKPRESSURE_MAX_PENDING = int(os.environ.get("BACKPRESSURE_MAX_PENDING", str(max(100, MAX_WORKERS * 4))))
 BACKPRESSURE_CHECK_RETRIES = int(os.environ.get("BACKPRESSURE_CHECK_RETRIES", "3"))
@@ -215,7 +193,7 @@ BACKPRESSURE_CHECK_SLEEP = float(os.environ.get("BACKPRESSURE_CHECK_SLEEP", "1.0
 DEGRADED_MAX_DOMAINS = int(os.environ.get("DEGRADED_MAX_DOMAINS", "40"))
 DEGRADED_RELAX_QUALITY = int(os.environ.get("DEGRADED_RELAX_QUALITY", "15"))  # reduce quality target
 DEGRADED_SEARCH_RESULTS_PER_QUERY = int(os.environ.get("DEGRADED_SEARCH_RESULTS_PER_QUERY", "20"))
-DEGRADED_SHORT_HEAD_TIMEOUT = float(os.environ.get("DEGRADED_SHORT_HEAD_TIMEOUT", "1.5"))  # keep as float
+DEGRADED_SHORT_HEAD_TIMEOUT = float(os.environ.get("DEGRADED_SHORT_HEAD_TIMEOUT", "1.5"))
 DEGRADED_SHORT_GET_TIMEOUT = float(os.environ.get("DEGRADED_SHORT_GET_TIMEOUT", "2.0"))
 DEGRADED_PREFERRED_ORDER = (os.environ.get("DEGRADED_PREFERRED_ORDER", "ddg,searx,gsearch").split(","))
 
@@ -224,31 +202,13 @@ SEEN_MAX_SIZE = int(os.environ.get("SEEN_MAX_SIZE", "20000"))  # tamaño bounded
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-# reduce noisy urllib3 retry logs that clutter terminal (configurable)
-logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # Flask app
 app = Flask(__name__)
 
 # ---------------- HTTP Session with pool & retries ----------------
 SESSION = requests.Session()
-
-def _make_retry_strategy():
-    # Conservative retry strategy to avoid lots of reattempt logs and retries on read timeouts.
-    total = int(os.environ.get("REQUESTS_RETRY_TOTAL", "1"))  # default 1 retry
-    backoff = float(os.environ.get("REQUESTS_BACKOFF_FACTOR", "0.2"))
-    status_forcelist = (429, 500, 502, 503, 504)
-    try:
-        # Try using modern signature (allowed_methods)
-        return Retry(total=total, backoff_factor=backoff, status_forcelist=status_forcelist, allowed_methods=frozenset(['GET', 'HEAD']))
-    except TypeError:
-        # Fallback for older urllib3 versions where param is method_whitelist
-        try:
-            return Retry(total=total, backoff_factor=backoff, status_forcelist=status_forcelist, method_whitelist=frozenset(['GET', 'HEAD']))
-        except Exception:
-            return Retry(total=total, backoff_factor=backoff, status_forcelist=status_forcelist)
-
-RETRY_STRAT = _make_retry_strategy()
+RETRY_STRAT = Retry(total=2, backoff_factor=0.3, status_forcelist=(429, 500, 502, 503, 504))
 ADAPTER = HTTPAdapter(pool_connections=HTTP_CONCURRENCY, pool_maxsize=HTTP_CONCURRENCY, max_retries=RETRY_STRAT)
 SESSION.mount("https://", ADAPTER)
 SESSION.mount("http://", ADAPTER)
@@ -260,89 +220,16 @@ def rand_headers(additional: dict = None) -> dict:
         h.update(additional)
     return h
 
-# ---------------- Domain circuit-breaker helpers (Mejora 16) ----------------
-def _domain_circuit_key(domain: str) -> str:
-    """Return canonical root key for the domain for circuit bookkeeping."""
-    try:
-        return canonical_domain_key_from_url(domain, prefer_root=True) or root_domain_of(domain)
-    except Exception:
-        return root_domain_of(domain)
-
-def domain_is_available_for_checks(domain: str) -> bool:
-    """
-    Return False if the domain has an open circuit (blocked_until in future).
-    """
-    if not domain:
-        return False
-    key = _domain_circuit_key(domain)
-    with _domain_circuit_lock:
-        rec = _DOMAIN_CIRCUIT.get(key)
-        if not rec:
-            return True
-        now = time.time()
-        if rec.get("circuit_open_until", 0.0) > now:
-            return False
-        return True
-
-def _domain_mark_failure(domain: str, err: str = ""):
-    """
-    Increment failure count for domain; if exceeds threshold open circuit for cooldown period.
-    """
-    try:
-        if not domain:
-            return
-        if is_private_host(domain):
-            # don't bookkeep private hosts
-            return
-        key = _domain_circuit_key(domain)
-        now = time.time()
-        with _domain_circuit_lock:
-            rec = _DOMAIN_CIRCUIT.setdefault(key, {"failures": 0, "last_failure": 0.0, "circuit_open_until": 0.0, "last_error": ""})
-            rec["failures"] = rec.get("failures", 0) + 1
-            rec["last_failure"] = now
-            rec["last_error"] = (err or "")[:300]
-            failures = rec["failures"]
-            if failures >= DOMAIN_MAX_FAILURES_BEFORE_TRIP:
-                rec["circuit_open_until"] = now + DOMAIN_COOLDOWN_SECONDS
-                logging.warning("Domain %s tripped circuit until %d (failures=%d) err=%s", key, int(rec["circuit_open_until"]), failures, rec["last_error"])
-            else:
-                logging.info("Domain %s failure recorded (failures=%d) err=%s", key, failures, rec["last_error"])
-    except Exception as e:
-        logging.debug("Failed to mark domain failure for %s: %s", domain, e)
-
-def _domain_mark_success(domain: str):
-    """Reset failure counters on successful interaction with domain."""
-    try:
-        if not domain:
-            return
-        if is_private_host(domain):
-            return
-        key = _domain_circuit_key(domain)
-        with _domain_circuit_lock:
-            rec = _DOMAIN_CIRCUIT.setdefault(key, {"failures": 0, "last_failure": 0.0, "circuit_open_until": 0.0, "last_error": ""})
-            rec["failures"] = 0
-            rec["last_error"] = ""
-            rec["circuit_open_until"] = 0.0
-            rec["last_success"] = time.time()
-            logging.debug("Domain %s marked success (counters reset)", key)
-    except Exception:
-        pass
-
-def get_domain_circuit_status() -> Dict[str, Dict[str, Any]]:
-    with _domain_circuit_lock:
-        return {k: dict(v) for k, v in _DOMAIN_CIRCUIT.items()}
-
-@app.route("/domain_circuit_status", methods=["GET"])
-def domain_circuit_status_view():
-    status = get_domain_circuit_status()
-    return jsonify({"domains": status})
-
 # ---------------- ReDoS-safe regex helpers ----------------
 @functools.lru_cache(maxsize=_SAFE_RE_COMPILE_CACHE_SIZE)
 def _compile_re_cached(pattern_str: str, flags: int = 0):
+    # Compila y cachea patrones por string+flags
     return re.compile(pattern_str, flags)
 
 def _ensure_compiled(pattern, flags=0):
+    """
+    Acepta str o Pattern. Si es str -> usa cache; si ya es Pattern -> lo devuelve.
+    """
     try:
         if hasattr(pattern, "search"):
             return pattern
@@ -385,6 +272,12 @@ def safe_match(pattern, text, flags=0, max_len: Optional[int] = None):
 
 # ---------------- LRUSet + canonicalization helpers (Mejora 13) ----------------
 class LRUSet:
+    """
+    Set con comportamiento LRU bounded. Implementado con OrderedDict para eficiencia.
+    - add(item) -> True si fue añadido (no estaba), False si ya existía.
+    - __contains__(item) -> bool
+    - len(), iteración, clear()
+    """
     def __init__(self, maxsize: int = 10000):
         self._maxsize = max(1, int(maxsize))
         self._od = collections.OrderedDict()
@@ -417,6 +310,14 @@ class LRUSet:
         return list(self._od.keys())
 
 def _normalize_hostname(host: str) -> str:
+    """
+    Normaliza host:
+      - strip
+      - quitar trailing dot
+      - lowercase
+      - punycode (idna) si está disponible
+      - no gestiona el puerto aquí
+    """
     if not host:
         return ""
     h = host.strip().rstrip(".")
@@ -424,23 +325,31 @@ def _normalize_hostname(host: str) -> str:
         h = h.lower()
     except Exception:
         pass
+    # si contiene IPv6 con brackets, dejarlo
     if h.startswith("[") and h.endswith("]"):
         return h
+    # no tocar puerto aquí; separarlo con urlparse si viene
     try:
         if idna:
             try:
+                # si incluye caracteres no-ascii esto convertirá a punycode
                 h = idna.encode(h).decode("ascii")
             except Exception:
+                # si falla, mantener la versión lowercase
                 pass
     except Exception:
         pass
     return h
 
 def canonicalize_netloc(parsed: urlparse) -> Tuple[str, Optional[int], str]:
+    """
+    Devuelve (host_canonical, port_or_None, scheme)
+    """
     host = parsed.hostname or ""
     port = parsed.port
     scheme = (parsed.scheme or "").lower()
     host = _normalize_hostname(host)
+    # quitar puerto por defecto
     try:
         if port:
             if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
@@ -450,10 +359,16 @@ def canonicalize_netloc(parsed: urlparse) -> Tuple[str, Optional[int], str]:
     return host, port, scheme
 
 def canonical_domain_key_from_url(url: str, prefer_root: bool = True) -> str:
+    """
+    Toma una URL o cadena, la parsea y devuelve la clave canónica para dedupe.
+    Por política del proyecto devolvemos root_domain_of(host) (ej: example.com) si prefer_root True.
+    Si prefer_root False devuelve host punycode normalizado (ej: blog.example.com).
+    """
     if not url:
         return ""
     try:
         u = url.strip()
+        # for parsing, guarantee a scheme
         if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", u):
             u = "https://" + u
         parsed = urlparse(u)
@@ -469,6 +384,7 @@ def canonical_domain_key_from_url(url: str, prefer_root: bool = True) -> str:
         return host.lower()
     except Exception:
         try:
+            # fallback: strip schema and path
             return re.sub(r"^https?://", "", (url or "").strip(), flags=re.I).split("/")[0].lower()
         except Exception:
             return (url or "").strip().lower()
@@ -655,6 +571,11 @@ start_proxy_health_thread()
 # ---------------- SSRF / egress safety ----------------
 @functools.lru_cache(maxsize=1024)
 def is_private_host(host: str) -> bool:
+    """
+    Resuelve host y devuelve True si alguna IP de la resolución es privada/loopback/reserved/multicast.
+    Si ocurre cualquier error en la resolución, devuelve True (conservador).
+    Nota: NO se usa caché para forzar resolución en red.
+    """
     try:
         if not host:
             return True
@@ -693,7 +614,7 @@ def _fetch_robots_for_host(host: str) -> Optional[robotparser.RobotFileParser]:
         content = None
         for url in candidates:
             try:
-                r = SESSION.request("get", url, headers=rand_headers(), timeout=4.0, allow_redirects=True, proxies=None)
+                r = SESSION.request("get", url, headers=rand_headers(), timeout=4, allow_redirects=True, proxies=None)
                 if r and r.status_code == 200 and r.text:
                     content = r.text
                     try:
@@ -721,13 +642,6 @@ def _fetch_robots_for_host(host: str) -> Optional[robotparser.RobotFileParser]:
                 parser.parse(lines)
             except Exception:
                 return None
-        # cleanup large local content variable
-        try:
-            del content
-            del lines
-        except Exception:
-            pass
-        _maybe_collect()
         return parser
     except Exception as e:
         logging.debug("Failed to fetch/parse robots for %s: %s", host, e)
@@ -788,6 +702,10 @@ def _update_domain_last_ts(host: str):
 
 # ---------------- Safe response wrapper ----------------
 class _SafeResponse:
+    """
+    Response-like wrapper that contiene partes importantes de requests.Response
+    pero garantiza que la respuesta original se cerró en http_request.
+    """
     def __init__(self, status_code: int = None, text: str = "", content: bytes = b"", headers: dict = None, elapsed: timedelta = None, url: str = None):
         self.status_code = status_code
         self.text = text or ""
@@ -800,13 +718,14 @@ class _SafeResponse:
         return json.loads(self.text) if self.text else {}
 
     def close(self):
+        # no-op; original connection ya cerrada dentro de http_request
         return None
 
     def __bool__(self):
         return self.status_code is not None
 
 # ---------------- http_request wrapper (con SSRF check + proxy pool + circuit handling + politeness) ----------------
-def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_redirects: bool = True,
+def http_request(method: str, url: str, timeout: int = DEFAULT_TIMEOUT, allow_redirects: bool = True,
                  headers: dict = None, max_retries: int = 3, backoff_base: float = 2.0,
                  ignore_robots: bool = False) -> Optional[_SafeResponse]:
     parsed = None
@@ -848,18 +767,6 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
     attempt = 0
     last_exc = None
     tried_proxies = set()
-    host_for_politeness = None
-    if parsed:
-        host_for_politeness = parsed.hostname
-
-    # If domain-level circuit is open, skip requests early
-    try:
-        if host_for_politeness and not domain_is_available_for_checks(host_for_politeness):
-            logging.info("http_request: domain circuit open for %s -> skipping request %s", host_for_politeness, url)
-            return None
-    except Exception:
-        pass
-
     while attempt <= max_retries:
         attempt += 1
         proxy = pick_proxy()
@@ -877,6 +784,7 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
 
         domain_sem = None
         sem_acquired = False
+        host_for_politeness = parsed.hostname if parsed else None
         start_time = time.time()
         try:
             if host_for_politeness:
@@ -897,10 +805,11 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
 
             try:
                 h = rand_headers(headers or {})
-                # timeout can be float
+                # perform request
                 r = SESSION.request(method.upper(), url, headers=h, timeout=timeout, allow_redirects=allow_redirects, proxies=proxies)
                 if r is None:
                     raise requests.exceptions.RequestException("No response")
+                # capture metadata & content immediately and close original response to avoid leaks
                 try:
                     status = r.status_code
                 except Exception:
@@ -909,6 +818,7 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                     text = r.text if getattr(r, "text", None) is not None else ""
                 except Exception:
                     try:
+                        # fallback to content decode
                         text = r.content.decode("utf-8", errors="replace") if getattr(r, "content", None) else ""
                     except Exception:
                         text = ""
@@ -930,21 +840,13 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                     url_resp = getattr(r, "url", url)
                 except Exception:
                     url_resp = url
+                # close the original response to free sockets/resources
                 try:
                     r.close()
                 except Exception:
                     pass
 
-                # free local r reference asap
-                try:
-                    del r
-                except Exception:
-                    try:
-                        r = None
-                    except Exception:
-                        pass
-                _maybe_collect()
-
+                # handle certain status cases (429, 5xx) - create SafeResponse to inspect status
                 if status == 429:
                     logging.info("429 on %s (proxy=%s) attempt=%d", url, proxy_used, attempt)
                     if proxy_used:
@@ -955,12 +857,6 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                             tried_proxies.add(proxy_used)
                     wait = min(backoff_base ** attempt + random.random(), MAX_BACKOFF)
                     last_exc = requests.exceptions.RequestException("429")
-                    # cleanup local large vars before sleep
-                    try:
-                        del text, content, headers_resp
-                    except Exception:
-                        pass
-                    _maybe_collect()
                     time.sleep(wait)
                     continue
                 if status is not None and 500 <= status < 600:
@@ -973,14 +869,10 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                     wait = min(backoff_base ** attempt + random.random(), MAX_BACKOFF)
                     logging.info("5xx on %s status=%s (proxy=%s); retrying in %.1f s", url, status, proxy_used, wait)
                     last_exc = requests.exceptions.RequestException(f"5xx:{status}")
-                    try:
-                        del text, content, headers_resp
-                    except Exception:
-                        pass
-                    _maybe_collect()
                     time.sleep(wait)
                     continue
 
+                # on success or other statuses we return a SafeResponse built from captured data
                 if proxy_used:
                     lat = elapsed.total_seconds() if elapsed else 0.0
                     with _proxy_lock:
@@ -992,23 +884,7 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                         _update_domain_last_ts(host_for_politeness)
                 except Exception:
                     pass
-
-                # Mark domain success on receiving a valid response (non-None)
-                try:
-                    if host_for_politeness:
-                        _domain_mark_success(host_for_politeness)
-                except Exception:
-                    pass
-
-                resp = _SafeResponse(status_code=status, text=text, content=content, headers=headers_resp, elapsed=elapsed, url=url_resp)
-
-                # cleanup local large vars after moving into SafeResponse
-                try:
-                    del text, content, headers_resp
-                except Exception:
-                    pass
-                _maybe_collect()
-                return resp
+                return _SafeResponse(status_code=status, text=text, content=content, headers=headers_resp, elapsed=elapsed, url=url_resp)
 
             except requests.exceptions.RequestException as e:
                 last_exc = e
@@ -1020,12 +896,6 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                         _mark_proxy_failure(pinfo, repr(e))
                         tried_proxies.add(proxy_used)
                 wait = min(backoff_base ** attempt + random.random(), MAX_BACKOFF)
-                # cleanup local large vars
-                try:
-                    del text, content, headers_resp
-                except Exception:
-                    pass
-                _maybe_collect()
                 time.sleep(wait)
                 continue
             except Exception as e:
@@ -1037,11 +907,6 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                     if pinfo:
                         _mark_proxy_failure(pinfo, repr(e))
                         tried_proxies.add(proxy_used)
-                try:
-                    del text, content, headers_resp
-                except Exception:
-                    pass
-                _maybe_collect()
                 time.sleep(min(backoff_base ** attempt, MAX_BACKOFF))
                 continue
         finally:
@@ -1056,12 +921,6 @@ def http_request(method: str, url: str, timeout: float = DEFAULT_TIMEOUT, allow_
                 except Exception:
                     logging.debug("Failed to release domain semaphore for %s", host_for_politeness)
     logging.debug("http_request failed for %s after %d attempts; last_exc=%s", url, max_retries, last_exc)
-    # Mark domain failure after exhausting attempts (only for non-private hosts)
-    try:
-        if parsed and parsed.hostname and not is_private_host(parsed.hostname):
-            _domain_mark_failure(parsed.hostname, err=str(last_exc))
-    except Exception:
-        pass
     return None
 
 # ---------------- TF-IDF helper (safe regex use) ----------------
@@ -1091,8 +950,6 @@ def tfidf_similarity(a: str, b: str) -> float:
 # ---------------- Concurrency primitives ----------------
 _http_semaphore = threading.BoundedSemaphore(HTTP_CONCURRENCY)
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-# NOTE: whois removed by user request; no dedicated whois executor is created.
 
 # ---------------- Fast filter (Capa 0) ----------------
 _suspicious_tlds = { "xyz", "top", "club", "online", "pw", "tk", "loan", "win" }
@@ -1135,6 +992,9 @@ def save_blacklist():
         pass
 
 def domain_mark_rejected(domain: str):
+    """
+    Marca un dominio (usando clave canónica root) como rechazado en el blacklist dinámico.
+    """
     try:
         root = canonical_domain_key_from_url(domain, prefer_root=True) or root_domain_of(domain)
     except Exception:
@@ -1213,7 +1073,7 @@ def fast_filter(prompt: str, domain: str, keywords: Optional[List[str]] = None) 
             for k in keywords:
                 prompt_tokens.update(safe_findall(r"[A-Za-z0-9]{3,}", k.lower()))
         else:
-            prompt_tokens.update(safe_findall(r"[A-Za-zÀ-ÿ0-9]{3,}", (prompt or "").lower()))
+            prompt_tokens.update(safe_findall(r"[A-Za-z0-9]{3,}", (prompt or "").lower()))
         overlap = domain_tokens.intersection(prompt_tokens)
         overlap_score = min(len(overlap) * 6, 30)
         if overlap:
@@ -1244,6 +1104,12 @@ def fast_filter(prompt: str, domain: str, keywords: Optional[List[str]] = None) 
 
 # ---------------- Helper to safely extract URLs from arbitrary backend items ----------------
 def safe_extract_urls(item, _depth=0, _max_depth=6, _acc=None, _max_urls=200) -> List[str]:
+    """
+    Extracción segura de URLs desde estructuras arbitrarias.
+    - limita profundidad (_max_depth)
+    - limita número total de URLs devueltas por item (_max_urls)
+    - evita aplicar operaciones costosas sobre strings muy grandes
+    """
     if _acc is None:
         _acc = []
     try:
@@ -1251,11 +1117,13 @@ def safe_extract_urls(item, _depth=0, _max_depth=6, _acc=None, _max_urls=200) ->
             return []
         if item is None:
             return []
+        # strings: aceptamos si parecen urls (pero truncamos primero)
         if isinstance(item, str):
             s = item.strip()
             if s:
                 _acc.append(s)
             return list(dict.fromkeys(_acc))[:_max_urls]
+        # dict: mira claves habituales y luego valores
         if isinstance(item, dict):
             for k in ("href", "url", "link", "result", "link_url"):
                 if len(_acc) >= _max_urls:
@@ -1268,8 +1136,9 @@ def safe_extract_urls(item, _depth=0, _max_depth=6, _acc=None, _max_urls=200) ->
                     if len(_acc) >= _max_urls:
                         break
                     if isinstance(v, str) and v.startswith("http"):
-                        _acc.append(v)
+                        _acc.append(v.strip())
             return list(dict.fromkeys(_acc))[:_max_urls]
+        # list/tuple/set: iterar con límite de profundidad/urls
         if isinstance(item, (tuple, list, set)):
             for sub in item:
                 if len(_acc) >= _max_urls:
@@ -1279,6 +1148,7 @@ def safe_extract_urls(item, _depth=0, _max_depth=6, _acc=None, _max_urls=200) ->
                 except Exception:
                     continue
             return list(dict.fromkeys(u for u in _acc if u))[:_max_urls]
+        # iterables genéricos
         try:
             for sub in item:
                 if len(_acc) >= _max_urls:
@@ -1292,11 +1162,7 @@ def safe_extract_urls(item, _depth=0, _max_depth=6, _acc=None, _max_urls=200) ->
     return list(dict.fromkeys(u for u in _acc if u))[:_max_urls]
 
 # ---------------- Network-level helpers ----------------
-def domain_alive(domain: str, head_timeout: float = HEAD_TIMEOUT, get_timeout: float = DEFAULT_TIMEOUT, retries: int = 2) -> bool:
-    """
-    Comprueba rápidamente si el dominio responde con HEAD/GET.
-    Ahora usa timeouts como floats para evitar truncados a 1 segundo.
-    """
+def domain_alive(domain: str, head_timeout=HEAD_TIMEOUT, get_timeout=DEFAULT_TIMEOUT, retries=2) -> bool:
     if not domain:
         return False
     schemes = ("https://", "http://")
@@ -1313,17 +1179,6 @@ def domain_alive(domain: str, head_timeout: float = HEAD_TIMEOUT, get_timeout: f
                         r.close()
                     except Exception:
                         pass
-                    # mark success for domain
-                    try:
-                        _domain_mark_success(domain)
-                    except Exception:
-                        pass
-                    # free reference
-                    try:
-                        del r
-                    except Exception:
-                        pass
-                    _maybe_collect()
                     return True
                 if r is not None and r.status_code in (403, 405, 400):
                     with _http_semaphore:
@@ -1333,40 +1188,20 @@ def domain_alive(domain: str, head_timeout: float = HEAD_TIMEOUT, get_timeout: f
                             r2.close()
                         except Exception:
                             pass
-                        try:
-                            _domain_mark_success(domain)
-                        except Exception:
-                            pass
-                        try:
-                            del r2
-                        except Exception:
-                            pass
-                        _maybe_collect()
                         return True
                 if r is not None:
                     try:
                         r.close()
                     except Exception:
                         pass
-                    try:
-                        del r
-                    except Exception:
-                        pass
-                    _maybe_collect()
             except Exception:
                 time.sleep(0.5 + random.random() * 0.5)
             time.sleep(0.1)
-    # if we reach here, mark a failure for the domain (so circuit counts)
-    try:
-        _domain_mark_failure(domain, err="domain_alive_false")
-    except Exception:
-        pass
     return False
 
 def domain_alive_short(domain: str) -> bool:
     try:
-        # do NOT cast to int: keep fractional seconds if present
-        return domain_alive(domain, head_timeout=DEGRADED_SHORT_HEAD_TIMEOUT, get_timeout=DEGRADED_SHORT_GET_TIMEOUT, retries=0)
+        return domain_alive(domain, head_timeout=int(DEGRADED_SHORT_HEAD_TIMEOUT), get_timeout=int(DEGRADED_SHORT_GET_TIMEOUT), retries=0)
     except Exception:
         return False
 
@@ -1379,6 +1214,7 @@ def sanitize_url_candidate(u: str) -> Optional[str]:
         if parsed.scheme and parsed.scheme not in ("http", "https"):
             return None
         if not parsed.netloc:
+            # usar safe_match para evitar ReDoS
             if safe_match(r"^[A-Za-z0-9\.-]+\.[A-Za-z]{2,6}(/|$)", u):
                 return "https://" + u
             return None
@@ -1401,82 +1237,26 @@ def clean_domain_from_url(url: str) -> str:
         return ""
 
 # ---------------- Fetch + heavy_check improvements ----------------
-def fetch_homepage_text(domain: str, timeout: float = 6.0) -> str:
-    """
-    Fetch homepage text with the following behavior:
-      - If the homepage is <= HOME_MAX_BYTES_TO_FULL_FETCH (500 KB by default), fetch whole page and extract
-        title, meta description, first <p> blocks (like before).
-      - If it is larger, do a lightweight extraction: read only the initial bytes (STREAM_INITIAL_BYTES)
-        and extract:
-         - <title>
-         - <meta name="description">
-         - <meta name="keywords">
-         - <link rel="canonical">
-         - first few <script> and <style> blocks (their signatures / src or small inline content)
-         - <header>, <nav>, and top structural blocks (first <header>, first <nav>, first big <div> at top)
-         - detect main marketing/CMS script srcs (gtm, google-analytics, analytics.js, wp-json, wp-content, /wp-includes/)
-      - Careful with memory: close responses, delete heavy vars, call GC if debug enabled.
-    """
-    HOME_MAX_BYTES_TO_FULL_FETCH = 500 * 1024  # 500 KB
-    STREAM_INITIAL_BYTES = int(os.environ.get("STREAM_INITIAL_BYTES", str(160 * 1024)))  # Default 160 KB to parse top-of-page
-    HEAD_TRY_TIMEOUT = float(os.environ.get("HEAD_TRY_TIMEOUT", str(HEAD_TIMEOUT)))
+def fetch_homepage_text(domain: str, timeout: int = 6) -> str:
     try:
-        url_https = f"https://{domain}/"
-        url_http = f"http://{domain}/"
-
-        # 1) Try HEAD to quickly inspect Content-Length (and keep politeness)
-        head_resp = None
-        try:
-            with _http_semaphore:
-                head_resp = SESSION.request("head", url_https, headers=rand_headers(), timeout=HEAD_TRY_TIMEOUT, allow_redirects=True)
-            if head_resp is None or head_resp.status_code >= 400:
+        with _http_semaphore:
+            url = f"https://{domain}/"
+            r = http_request("get", url, timeout=timeout, allow_redirects=True)
+            if not r or r.status_code != 200:
+                if r:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                url = f"http://{domain}/"
+                r = http_request("get", url, timeout=timeout, allow_redirects=True)
+            if r and r.status_code == 200 and r.text:
+                text = r.text
                 try:
-                    if head_resp:
-                        head_resp.close()
-                        del head_resp
+                    r.close()
                 except Exception:
                     pass
-                with _http_semaphore:
-                    head_resp = SESSION.request("head", url_http, headers=rand_headers(), timeout=HEAD_TRY_TIMEOUT, allow_redirects=True)
-        except Exception:
-            # ignore head failures - we'll fallback to GET streaming
-            try:
-                if head_resp:
-                    head_resp.close()
-            except Exception:
-                pass
-            head_resp = None
-
-        content_length = None
-        try:
-            if head_resp and head_resp.headers:
-                cl = head_resp.headers.get("Content-Length") or head_resp.headers.get("content-length")
-                if cl:
-                    try:
-                        content_length = int(cl)
-                    except Exception:
-                        content_length = None
-            try:
-                if head_resp:
-                    head_resp.close()
-            except Exception:
-                pass
-            try:
-                del head_resp
-            except Exception:
-                pass
-        except Exception:
-            content_length = None
-
-        # Decide strategy
-        is_large_by_header = False
-        if content_length is not None and content_length > HOME_MAX_BYTES_TO_FULL_FETCH:
-            is_large_by_header = True
-
-        # Helper to parse full HTML (small pages)
-        def _parse_full_text(html_text: str) -> str:
-            try:
-                soup = BeautifulSoup(html_text, "html.parser")
+                soup = BeautifulSoup(text, "html.parser")
                 texts = []
                 title = ""
                 try:
@@ -1487,420 +1267,74 @@ def fetch_homepage_text(domain: str, timeout: float = 6.0) -> str:
                     texts.append(title)
                 m = None
                 try:
-                    # meta name=description (case-insensitive)
-                    m = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
+                    m = soup.find("meta", attrs={"name": "description"})
                 except Exception:
                     m = None
                 if m and m.get("content"):
                     texts.append(m.get("content").strip())
-                # if meta keywords present
-                mk = None
-                try:
-                    mk = soup.find("meta", attrs={"name": re.compile(r"keywords", re.I)})
-                except Exception:
-                    mk = None
-                if mk and mk.get("content"):
-                    texts.append(mk.get("content").strip())
                 ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")][:8]
                 texts.extend([p for p in ps if p])
                 if not texts:
                     texts.append(soup.get_text(" ", strip=True)[:4000])
-                result = " ".join(texts)[:20000]
+                return " ".join(texts)[:20000]
+            if r:
                 try:
-                    if hasattr(soup, "decompose"):
-                        try:
-                            soup.decompose()
-                        except Exception:
-                            pass
-                    del soup
-                except Exception:
-                    pass
-                _maybe_collect()
-                return result
-            except Exception as e:
-                logging.debug("Full-parse failed for %s: %s", domain, e)
-                return ""
-
-        # Helper to parse top-of-page partial HTML for prioritized tags
-        def _parse_top_partial(html_bytes: bytes) -> str:
-            try:
-                html_text = html_bytes.decode("utf-8", errors="replace")
-            except Exception:
-                html_text = html_bytes.decode("latin-1", errors="replace") if html_bytes else ""
-            try:
-                soup = BeautifulSoup(html_text, "html.parser")
-            except Exception:
-                # fallback: regex-ish extraction
-                soup = None
-
-            extracted = []
-            # title
-            try:
-                if soup and soup.title and soup.title.string:
-                    extracted.append(soup.title.string.strip())
-                else:
-                    m = safe_search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.I | re.S, max_len=len(html_text))
-                    if m:
-                        extracted.append(m.group(1).strip())
-            except Exception:
-                pass
-
-            # meta description & keywords
-            try:
-                if soup:
-                    md = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
-                    if md and md.get("content"):
-                        extracted.append(md.get("content").strip())
-                    mk = soup.find("meta", attrs={"name": re.compile(r"keywords", re.I)})
-                    if mk and mk.get("content"):
-                        extracted.append(mk.get("content").strip())
-                else:
-                    m = safe_search(r'<meta[^>]+name=["\']?description["\']?[^>]*content=["\'](.*?)["\']', html_text, flags=re.I | re.S, max_len=len(html_text))
-                    if m:
-                        extracted.append(m.group(1).strip())
-                    mk = safe_search(r'<meta[^>]+name=["\']?keywords["\']?[^>]*content=["\'](.*?)["\']', html_text, flags=re.I | re.S, max_len=len(html_text))
-                    if mk:
-                        extracted.append(mk.group(1).strip())
-            except Exception:
-                pass
-
-            # canonical link
-            try:
-                if soup:
-                    can = soup.find("link", attrs={"rel": re.compile(r"canonical", re.I)})
-                    if can and can.get("href"):
-                        extracted.append(can.get("href").strip())
-                else:
-                    m = safe_search(r'<link[^>]+rel=["\']?canonical["\']?[^>]*href=["\'](.*?)["\']', html_text, flags=re.I | re.S, max_len=len(html_text))
-                    if m:
-                        extracted.append(m.group(1).strip())
-            except Exception:
-                pass
-
-            # header / nav / top structure
-            try:
-                top_bits = []
-                if soup:
-                    header = soup.find("header")
-                    if header:
-                        top_bits.append(header.get_text(" ", strip=True)[:1200])
-                    nav = soup.find("nav")
-                    if nav:
-                        top_bits.append(nav.get_text(" ", strip=True)[:1200])
-                    # if no header/nav, try first big div near top
-                    if not top_bits:
-                        first_div = soup.find("div")
-                        if first_div:
-                            top_bits.append(first_div.get_text(" ", strip=True)[:1200])
-                else:
-                    # simple regex extraction of first <header> or <nav> content
-                    m = safe_search(r"<header.*?>(.*?)</header>", html_text, flags=re.I | re.S, max_len=len(html_text))
-                    if m:
-                        top_bits.append(re.sub(r"\s+", " ", m.group(1)).strip()[:1200])
-                    m2 = safe_search(r"<nav.*?>(.*?)</nav>", html_text, flags=re.I | re.S, max_len=len(html_text))
-                    if m2:
-                        top_bits.append(re.sub(r"\s+", " ", m2.group(1)).strip()[:1200])
-                    if not top_bits:
-                        m3 = safe_search(r"<div.*?>(.*?)</div>", html_text, flags=re.I | re.S, max_len=len(html_text))
-                        if m3:
-                            top_bits.append(re.sub(r"\s+", " ", m3.group(1)).strip()[:1200])
-                if top_bits:
-                    extracted.extend([t for t in top_bits if t])
-            except Exception:
-                pass
-
-            # gather first script/style blocks signatures: src attributes or inline snippet up to small len
-            try:
-                scripts = []
-                styles = []
-                marketing_signals = []
-                if soup:
-                    # scripts
-                    for idx, s in enumerate(soup.find_all("script")[:8]):
-                        src = s.get("src")
-                        if src:
-                            scripts.append(f"SCRIPT_SRC:{src}")
-                            # check for common marketing/CMS hints
-                            if re.search(r"(gtm|google-analytics|analytics|gtag|facebook|fbq|hotjar|segment|mixpanel|matomo|wp-)", src, re.I):
-                                marketing_signals.append(src)
-                        else:
-                            inline = s.get_text(" ", strip=True)[:240]
-                            if inline:
-                                scripts.append(f"SCRIPT_INLINE:{inline}")
-                                if re.search(r"(gtm|google-analytics|analytics|gtag|fbq|hotjar|mixpanel|matomo|wp-)", inline, re.I):
-                                    marketing_signals.append(inline[:200])
-                    # styles
-                    for idx, st in enumerate(soup.find_all("style")[:4]):
-                        inline = st.get_text(" ", strip=True)[:400]
-                        if inline:
-                            styles.append(inline)
-                else:
-                    # regex fallback
-                    for m in re.finditer(r'<script[^>]*\ssrc=["\'](.*?)["\']', html_text, flags=re.I):
-                        src = m.group(1)
-                        scripts.append(f"SCRIPT_SRC:{src}")
-                        if re.search(r"(gtm|google-analytics|analytics|gtag|facebook|fbq|hotjar|segment|mixpanel|matomo|wp-)", src, re.I):
-                            marketing_signals.append(src)
-                    # inline scripts
-                    for m in re.finditer(r'<script[^>]*>(.*?)</script>', html_text, flags=re.I | re.S):
-                        inline = re.sub(r"\s+", " ", m.group(1)).strip()[:240]
-                        if inline:
-                            scripts.append(f"SCRIPT_INLINE:{inline}")
-                            if re.search(r"(gtm|google-analytics|analytics|gtag|fbq|hotjar|mixpanel|matomo|wp-)", inline, re.I):
-                                marketing_signals.append(inline[:200])
-                    for m in re.finditer(r'<style[^>]*>(.*?)</style>', html_text, flags=re.I | re.S):
-                        st = re.sub(r"\s+", " ", m.group(1)).strip()[:400]
-                        if st:
-                            styles.append(st)
-                if scripts:
-                    extracted.append(" | ".join(scripts[:6]))
-                if styles:
-                    extracted.append("STYLE_SNIPPETS:" + (" | ".join(styles[:3]) if styles else ""))
-                if marketing_signals:
-                    extracted.append("MARKETING_SIGNALS:" + (" | ".join(marketing_signals[:6])))
-            except Exception:
-                pass
-
-            # fallback: if no extracted text, take a small plain-text snippet
-            if not extracted:
-                try:
-                    snippet = re.sub(r"\s+", " ", html_text)[:1200]
-                    if snippet:
-                        extracted.append(snippet)
-                except Exception:
-                    pass
-
-            try:
-                if soup and hasattr(soup, "decompose"):
-                    try:
-                        soup.decompose()
-                    except Exception:
-                        pass
-                    del soup
-            except Exception:
-                pass
-            _maybe_collect()
-            return " ".join([e for e in extracted if e])[:20000]
-
-        # If header indicated small page => fetch fully (allowed)
-        if not is_large_by_header:
-            # attempt full GET (https first, fallback to http)
-            try:
-                with _http_semaphore:
-                    r = http_request("get", url_https, timeout=timeout, allow_redirects=True)
-                if r is None or r.status_code != 200 or not r.text:
-                    try:
-                        if r:
-                            r.close()
-                    except Exception:
-                        pass
-                    with _http_semaphore:
-                        r = http_request("get", url_http, timeout=timeout, allow_redirects=True)
-                if r and r.status_code == 200 and r.text:
-                    text = r.text
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
-                    try:
-                        del r
-                    except Exception:
-                        pass
-                    res = _parse_full_text(text)
-                    try:
-                        del text
-                    except Exception:
-                        pass
-                    _maybe_collect()
-                    return res
-                if r:
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
-                    try:
-                        del r
-                    except Exception:
-                        pass
-            except Exception as e:
-                logging.debug("fetch_homepage_text full-get failed for %s: %s", domain, e)
-                # continue to streaming fallback below
-
-        # If we reach here -> either header said large or GET full failed; do streaming partial read
-        try:
-            # prefer https streaming
-            with _http_semaphore:
-                # use session.request directly to get streaming; reuse rand_headers
-                h = rand_headers()
-                r = SESSION.request("get", url_https, headers=h, timeout=timeout, stream=True, allow_redirects=True)
-                if r is None or r.status_code >= 400:
-                    try:
-                        if r:
-                            r.close()
-                    except Exception:
-                        pass
-                    with _http_semaphore:
-                        r = SESSION.request("get", url_http, headers=h, timeout=timeout, stream=True, allow_redirects=True)
-        except Exception as e:
-            logging.debug("fetch_homepage_text streaming GET failed for %s: %s", domain, e)
-            try:
-                if r:
                     r.close()
-            except Exception:
-                pass
-            # final fallback: return empty
-            return ""
-
-        if not r:
-            return ""
-
-        # If Content-Length known and > limit, we will early-stop and parse initial chunk
-        total_read = 0
-        chunks = []
-        try:
-            cl_header = r.headers.get("Content-Length")
-            if cl_header:
-                try:
-                    clv = int(cl_header)
-                    if clv > HOME_MAX_BYTES_TO_FULL_FETCH:
-                        # large - only read initial STREAM_INITIAL_BYTES
-                        to_read_limit = STREAM_INITIAL_BYTES
-                    else:
-                        to_read_limit = clv + 1024  # read full if small
-                except Exception:
-                    to_read_limit = STREAM_INITIAL_BYTES
-            else:
-                # unknown size: read up to HOME_MAX_BYTES_TO_FULL_FETCH + 1 to detect large
-                to_read_limit = HOME_MAX_BYTES_TO_FULL_FETCH + 1
-
-            for chunk in r.iter_content(chunk_size=8192):
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total_read += len(chunk)
-                # stop if we've read enough to decide
-                if total_read >= to_read_limit:
-                    break
-            initial_bytes = b"".join(chunks)
-            # If content-length header existed and less than limit we might have only read part - attempt to read rest only if small
-            is_large_stream_detected = False
-            if cl_header:
-                try:
-                    if int(cl_header) > HOME_MAX_BYTES_TO_FULL_FETCH:
-                        is_large_stream_detected = True
                 except Exception:
                     pass
-            else:
-                # if we read more than the HOME_MAX_BYTES threshold => treat as large
-                if total_read > HOME_MAX_BYTES_TO_FULL_FETCH:
-                    is_large_stream_detected = True
-
-            # If page is small (we read everything or header told small), attempt to fetch full page text via http_request to reuse parsing path
-            if not is_large_stream_detected:
-                # try obtain full text through normal http_request (non-stream) which handles decodings and nice parsing
-                try:
-                    try:
-                        r.close()
-                    except Exception:
-                        pass
-                    with _http_semaphore:
-                        full_r = http_request("get", url_https, timeout=timeout, allow_redirects=True)
-                    if full_r is None or full_r.status_code != 200 or not full_r.text:
-                        try:
-                            if full_r:
-                                full_r.close()
-                        except Exception:
-                            pass
-                        with _http_semaphore:
-                            full_r = http_request("get", url_http, timeout=timeout, allow_redirects=True)
-                    if full_r and full_r.status_code == 200 and full_r.text:
-                        text = full_r.text
-                        try:
-                            full_r.close()
-                        except Exception:
-                            pass
-                        try:
-                            del full_r
-                        except Exception:
-                            pass
-                        res = _parse_full_text(text)
-                        try:
-                            del text
-                        except Exception:
-                            pass
-                        _maybe_collect()
-                        return res
-                    if full_r:
-                        try:
-                            full_r.close()
-                        except Exception:
-                            pass
-                        try:
-                            del full_r
-                        except Exception:
-                            pass
-                except Exception:
-                    # If full fetch fails, fall through to partial parsing of initial_bytes
-                    pass
-
-            # For large pages: parse only the initial_bytes using partial parser
-            res = _parse_top_partial(initial_bytes)
-            try:
-                r.close()
-            except Exception:
-                pass
-            try:
-                del r
-            except Exception:
-                pass
-            try:
-                del chunks, initial_bytes
-            except Exception:
-                pass
-            _maybe_collect()
-            return res
-        except Exception as e:
-            logging.debug("fetch_homepage_text streaming parse error for %s: %s", domain, e)
-            try:
-                if r:
-                    r.close()
-            except Exception:
-                pass
-            try:
-                del r
-            except Exception:
-                pass
-            _maybe_collect()
-            return ""
     except Exception as e:
         logging.debug("fetch_homepage_text error %s: %s", domain, e)
     return ""
 
-# ---------------- whois removed / stubbed (user requested whois elimination) ----------------
-def get_domain_age_months(domain: str) -> Optional[int]:
-    """
-    Whois functionality has been removed per user request.
-    Keep a safe stub that returns None so callers remain compatible.
-    """
-    return None
+# ---------------- whois seguro (async + timeout) ----------------
+_whois_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-# ---------------- ASSESS + HEAVY CHECK (REFACTORED) ----------------
-def assess_domain_quality_quick(domain: str, timeout: float = 6.0) -> Tuple[int, List[str]]:
-    """
-    Versión más rápida y segura de assess_domain_quality; diseñada para ejecutarse como subtarea.
-    """
+def _whois_lookup(domain: str):
+    try:
+        return whois_lib.whois(domain)
+    except Exception as e:
+        logging.debug("whois lookup failed for %s: %s", domain, e)
+        return None
+
+def get_domain_age_months(domain: str) -> Optional[int]:
+    if not whois_lib:
+        return None
+    try:
+        fut = _whois_executor.submit(_whois_lookup, domain)
+        try:
+            info = fut.result(timeout=4.0)
+        except concurrent.futures.TimeoutError:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            logging.debug("whois timed out for %s", domain)
+            return None
+        if not info:
+            return None
+        cd = info.get("creation_date") if isinstance(info, dict) else getattr(info, "creation_date", None)
+        if not cd:
+            return None
+        if isinstance(cd, list):
+            cd = cd[0]
+        if not hasattr(cd, "year"):
+            return None
+        years = time.gmtime().tm_year - cd.year
+        months = years * 12 + max(0, getattr(cd, "month", 1) - 1)
+        return int(months)
+    except Exception as e:
+        logging.debug("get_domain_age_months error %s: %s", domain, e)
+        return None
+
+def assess_domain_quality(domain: str) -> Tuple[int, List[str]]:
     score = 50
     reasons: List[str] = []
     try:
-        r = http_request("get", f"https://{domain}/", timeout=timeout, allow_redirects=True)
+        r = http_request("get", f"https://{domain}/", timeout=6, allow_redirects=True)
         if r and r.status_code == 200:
             text = r.text
             try:
                 r.close()
-            except Exception:
-                pass
-            try:
-                del r
             except Exception:
                 pass
             score = 65
@@ -1911,26 +1345,15 @@ def assess_domain_quality_quick(domain: str, timeout: float = 6.0) -> Tuple[int,
                 if p_count >= 5:
                     reasons.append(f"Content paragraphs={p_count}")
                     score = min(100, score + 8)
-                if soup.find("script", type="application/ld+json") or soup.find(attrs={"itemtype": _ensure_compiled(r"schema.org", re.I)}):
+                author_meta = soup.find("meta", attrs={"name": _ensure_compiled(r"author", re.I)})
+                if author_meta and author_meta.get("content"):
+                    reasons.append("Meta author found")
+                    score = min(100, score + 6)
+                if soup.find(attrs={"itemtype": _ensure_compiled(r"schema.org", re.I)}) or soup.find("script", type="application/ld+json"):
                     reasons.append("Structured data found")
                     score = min(100, score + 6)
-                # cleanup soup/text promptly
-                try:
-                    if hasattr(soup, "decompose"):
-                        try:
-                            soup.decompose()
-                        except Exception:
-                            pass
-                    del soup
-                except Exception:
-                    pass
             except Exception:
                 pass
-            try:
-                del text
-            except Exception:
-                pass
-            _maybe_collect()
         else:
             sc = r.status_code if r else "no-response"
             if r:
@@ -1938,14 +1361,10 @@ def assess_domain_quality_quick(domain: str, timeout: float = 6.0) -> Tuple[int,
                     r.close()
                 except Exception:
                     pass
-                try:
-                    del r
-                except Exception:
-                    pass
             score = 35
             reasons = [f"HTTP status {sc}"]
     except Exception as e:
-        logging.debug("assess_domain_quality_quick error %s: %s", domain, e)
+        logging.debug("assess_domain_quality error %s: %s", domain, e)
         score = 20
         reasons = ["No reachable homepage"]
     age_months = get_domain_age_months(domain)
@@ -1960,154 +1379,71 @@ def assess_domain_quality_quick(domain: str, timeout: float = 6.0) -> Tuple[int,
         reasons.insert(0, f"Score: {score} (aceptable)")
     else:
         reasons.insert(0, f"Score: {score} (rechazado)")
-    _maybe_collect()
     return int(score), reasons
 
-# Subtask timeouts (ajustables por entorno) - ahora floats
-SUBTASK_TIMEOUTS = {
-    "whois": 4.0,
-    "fetch_text": 6.0,
-    "assess_quick": 6.0,
-    "head_check": 3.0,
-}
-
 def heavy_check(prompt: str, domain: str, keywords: Optional[List[str]]=None) -> Dict:
-    """
-    Heavy check refactorizado:
-      - aplica HEAD-gate estricto al inicio: si domain_alive_short falla, retornamos rápido (no GETs)
-      - divide la comprobación en subtareas independientes con timeouts individuales
-      - agrega heurística para no marcar error por lentitud: si al menos una subtarea aporta datos usamos eso
-      - devuelve siempre dentro de un tiempo razonable (gestiona timeouts internamente)
-    """
-    start = time.time()
     reasons: List[str] = []
-    subtask_results = {"whois": None, "fetch_text": None, "assess_quick": None, "head_ok": None}
-    subtask_successes = 0
-
-    # ---------- HEAD-GATE: primer paso antes de cualquier GET pesado ----------
+    score = 50
     try:
-        try:
-            head_ok = domain_alive_short(domain)
-        except Exception:
-            head_ok = False
-        if not head_ok:
-            logging.info("heavy_check: head-gate failed for %s — returning low confidence", domain)
+        q_score, q_reasons = assess_domain_quality(domain)
+        reasons.extend(q_reasons[:6])
+        score = max(score, q_score)
+    except Exception as e:
+        logging.debug("heavy_check assess failed: %s", e)
+    text = ""
+    try:
+        text = fetch_homepage_text(domain, timeout=8)
+        if text:
+            sim = tfidf_similarity(prompt, text)
+            reasons.append(f"TFIDF-sim={sim:.3f}")
+            score = min(100, int(score + sim * 45))
+            if len(text) > 2000:
+                reasons.append("Long content (>2000 chars)")
+                score = min(100, score + 6)
+        else:
+            reasons.append("No homepage text fetched")
+    except Exception as e:
+        logging.debug("heavy_check fetch_homepage_text failed: %s", e)
+        reasons.append("Error fetching homepage text")
+    try:
+        with _http_semaphore:
+            r = http_request("get", f"https://{domain}/", timeout=6, allow_redirects=True)
+        if r and r.status_code == 200:
+            text2 = r.text
             try:
-                _domain_mark_failure(domain, err="head_gate_failed")
+                r.close()
             except Exception:
                 pass
-            elapsed = time.time() - start
-            return {"score": 10, "reasons": ["head-gate-failed"], "verdict": "reject", "elapsed": elapsed}
-        else:
-            subtask_results["head_ok"] = True
-            subtask_successes += 1
-            reasons.append("head-gate OK")
-    except Exception as e:
-        logging.debug("heavy_check head-gate exception for %s: %s", domain, e)
-
-    # Executor local con pocos hilos para correr subtareas (no bloquear el pool global)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as exec_local:
-        futures = {}
-        # whois - will not be scheduled because whois_lib is disabled (see above)
-        if whois_lib:
-            futures["whois"] = exec_local.submit(get_domain_age_months, domain)
-        else:
-            futures["whois"] = None
-
-        # fetch homepage text
-        futures["fetch_text"] = exec_local.submit(fetch_homepage_text, domain, SUBTASK_TIMEOUTS["fetch_text"])
-
-        # assess quick (tries GET and analyzes)
-        futures["assess_quick"] = exec_local.submit(assess_domain_quality_quick, domain, SUBTASK_TIMEOUTS["assess_quick"])
-
-        # collect results with timebox
-        for key, fut in list(futures.items()):
-            if fut is None:
-                continue
-            t0 = time.time()
-            timeout = SUBTASK_TIMEOUTS.get(key, 4.0)
+            soup = BeautifulSoup(text2, "html.parser")
+            title = ""
             try:
-                res = fut.result(timeout=timeout)
-                subtask_results[key] = res
-                # heurística de "éxito" por subtarea
-                if key == "whois":
-                    if res is not None:
-                        subtask_successes += 1
-                        reasons.append(f"whois-age-months={res}")
-                elif key == "fetch_text":
-                    if res and len(res) > 50:
-                        subtask_successes += 1
-                        reasons.append("fetched homepage text")
-                elif key == "assess_quick":
-                    if isinstance(res, tuple) and res[0] is not None:
-                        subtask_successes += 1
-                        sub_reasons = res[1] if isinstance(res[1], list) else []
-                        reasons.extend(sub_reasons[:3])
-            except concurrent.futures.TimeoutError:
-                reasons.append(f"subtask-timeout:{key}")
-                logging.debug("heavy_check subtask timeout %s for %s", key, domain)
-                try:
-                    fut.cancel()
-                except Exception:
-                    pass
-            except Exception as e:
-                reasons.append(f"subtask-error:{key}")
-                logging.debug("heavy_check subtask error %s for %s -> %s", key, domain, e)
-            finally:
-                elapsed = time.time() - t0
-                # if subtask took longer than expected we still continue but log
-                if elapsed > timeout:
-                    logging.debug("subtask %s elapsed %.2f > timeout %.2f for %s", key, elapsed, timeout, domain)
-
-    # Build aggregated score
-    score = 30
-    try:
-        # if assess_quick exists, use it as base
-        aq = subtask_results.get("assess_quick")
-        if isinstance(aq, tuple):
-            score = max(score, int(aq[0]))
-        # if fetched text, compute similarity
-        ft = subtask_results.get("fetch_text")
-        if ft:
-            try:
-                sim = tfidf_similarity(prompt, ft)
-                score = min(100, max(score, int(score + sim * 40)))
-                reasons.append(f"TFIDF-sim={sim:.3f}")
+                title = soup.title.string.strip() if soup.title and soup.title.string else ""
             except Exception:
-                pass
-            finally:
-                # cleanup fetched text reference ASAP
-                try:
-                    del ft
-                except Exception:
-                    pass
-                _maybe_collect()
-        # whois age bonus (stub returns None)
-        whois_age = subtask_results.get("whois")
-        if isinstance(whois_age, int):
-            if whois_age >= 60:
-                score = min(100, score + 10)
-            elif whois_age >= 12:
-                score = min(100, score + 4)
-        # head ok bonus
-        if subtask_results.get("head_ok"):
-            score = min(100, score + 6)
-    except Exception as e:
-        logging.debug("heavy_check aggregation error: %s", e)
-
-    # If no subtasks succeeded -> penalizamos fuertemente
-    if subtask_successes == 0:
-        reasons.append("No subtasks succeeded -> low confidence")
-        score = max(0, min(100, int(score * 0.4)))
-    else:
-        reasons.append(f"subtasks_succeeded={subtask_successes}")
-
-    # Finalize
+                title = ""
+            h1 = ""
+            try:
+                h1_tag = soup.find("h1")
+                if h1_tag:
+                    h1 = h1_tag.get_text(" ", strip=True)
+            except Exception:
+                h1 = ""
+            for candidate in (title, h1):
+                if candidate and prompt.lower() in candidate.lower():
+                    reasons.append("Prompt in title/h1")
+                    score = min(100, score + 10)
+                    break
+    except Exception:
+        pass
+    try:
+        age_months = get_domain_age_months(domain)
+        if age_months and age_months >= 24:
+            reasons.append(f"Domain age bonus ({age_months} months)")
+            score = min(100, score + 4)
+    except Exception:
+        pass
+    score = max(0, min(100, int(score)))
     verdict = "accept" if score >= QUALITY_ACCEPT else ("reject" if score < QUALITY_WARN else "maybe")
-    total_elapsed = time.time() - start
-    reasons = reasons[:12]
-    _maybe_collect()
-    return {"score": int(score), "reasons": reasons, "verdict": verdict, "elapsed": total_elapsed}
+    return {"score": int(score), "reasons": reasons, "verdict": verdict}
 
 # ---------------- Prompt analysis (keywords + intent) ----------------
 def simple_keyword_extraction(text: str, top_n: int = 6) -> List[str]:
@@ -2244,12 +1580,6 @@ def search_ddg(query: str, max_results: int = 20, country: Optional[str]=None) -
             if u.startswith("/url?q="):
                 u = u.split("/url?q=", 1)[1].split("&")[0]
             cleaned.append(u)
-        # cleanup local items
-        try:
-            del items, urls
-        except Exception:
-            pass
-        _maybe_collect()
         return cleaned[:max_results]
     except Exception as e:
         logging.debug("[ddg] error: %s", e)
@@ -2272,28 +1602,13 @@ def search_searx(query: str, max_results: int = 20, country: Optional[str]=None)
                     r.close()
                 except Exception:
                     pass
-                try:
-                    del r
-                except Exception:
-                    pass
-                _maybe_collect()
                 continue
             try:
                 r.close()
             except Exception:
                 pass
-            try:
-                del r
-            except Exception:
-                pass
             for item in j.get("results", [])[:max_results]:
                 urls.extend(safe_extract_urls(item))
-            # cleanup heavy json obj quickly
-            try:
-                del j
-            except Exception:
-                pass
-            _maybe_collect()
             if urls:
                 break
         except Exception as e:
@@ -2320,10 +1635,6 @@ def fallback_scrape_google(query: str, max_results: int = 10, country: Optional[
             r.close()
         except Exception:
             pass
-        try:
-            del r
-        except Exception:
-            pass
         soup = BeautifulSoup(text, "html.parser")
         urls = []
         for a in soup.find_all("a", href=True):
@@ -2333,21 +1644,6 @@ def fallback_scrape_google(query: str, max_results: int = 10, country: Optional[
                 urls.append(u)
             elif href.startswith("http"):
                 urls.append(href)
-        # cleanup soup and text
-        try:
-            if hasattr(soup, "decompose"):
-                try:
-                    soup.decompose()
-                except Exception:
-                    pass
-            del soup
-        except Exception:
-            pass
-        try:
-            del text
-        except Exception:
-            pass
-        _maybe_collect()
         return urls[:max_results]
     except Exception as e:
         logging.debug("[scrape-google] error: %s", e)
@@ -2396,30 +1692,6 @@ def engine_status_view():
         status = {k: dict(v) for k, v in _ENGINE_STATUS.items()}
     return jsonify({"engines": status})
 
-def retry_with_backoff(fn, *args, retries=2, backoff_base=2.0, max_backoff=MAX_BACKOFF, **kwargs):
-    attempt = 0
-    backoff = backoff_base
-    while True:
-        attempt += 1
-        try:
-            return fn(*args, **kwargs)
-        except requests.exceptions.RequestException as e:
-            logging.debug("Request exception: %s", e)
-            if attempt > retries:
-                raise
-            wait = min(backoff, max_backoff)
-            logging.info("Transient error, retrying in %.1f s (attempt %d/%d)", wait, attempt, retries)
-            time.sleep(wait)
-            backoff *= backoff_base
-        except Exception as e:
-            logging.debug("Non-requests error: %s", e)
-            if attempt > retries:
-                raise
-            wait = min(backoff, max_backoff)
-            logging.info("Error, retrying in %.1f s (attempt %d/%d)", wait, attempt, retries)
-            time.sleep(wait)
-            backoff *= backoff_base
-
 def search_with_fallback(query: str, max_results: int = 20, country: Optional[str]=None,
                          preferred_order: Optional[List[str]] = None) -> List[str]:
     if preferred_order is None:
@@ -2459,11 +1731,6 @@ def search_with_fallback(query: str, max_results: int = 20, country: Optional[st
                 logging.info("Engine %s attempt %d returned %d flat urls", engine, attempt, len(flat_urls))
                 if flat_urls:
                     engine_mark_success(engine)
-                    try:
-                        del urls
-                    except Exception:
-                        pass
-                    _maybe_collect()
                     return flat_urls[:max_results]
                 else:
                     last_err = "empty-results"
@@ -2527,11 +1794,6 @@ def quick_degraded_pipeline(queries: List[str], desired: int, prompt: str, keywo
                 urls = []
             for u in urls:
                 if len(domains) >= deg_target:
-                    try:
-                        del urls
-                    except Exception:
-                        pass
-                    _maybe_collect()
                     return domains
                 try:
                     cand = sanitize_url_candidate(u) or u
@@ -2539,6 +1801,7 @@ def quick_degraded_pipeline(queries: List[str], desired: int, prompt: str, keywo
                     if not key or key in seen:
                         continue
                     dom = clean_domain_from_url(cand) or key
+                    # normalizar dom a la representación display (root)
                     dom = key
                     if any(dom.endswith(s) for s in SOCIAL_BLACKLIST):
                         continue
@@ -2567,14 +1830,9 @@ def quick_degraded_pipeline(queries: List[str], desired: int, prompt: str, keywo
                             pass
                 except Exception:
                     continue
-            try:
-                del urls
-            except Exception:
-                pass
             time.sleep(0.05)
         except Exception:
             continue
-    _maybe_collect()
     return domains
 
 # ---------------- Rate limiter (simple fixed window) ----------------
@@ -2618,12 +1876,6 @@ def get_domains_from_prompt(prompt: str,
                             country: Optional[str] = None,
                             keywords: Optional[List[str]] = None,
                             intent: Optional[str] = None) -> List[Dict]:
-    """
-    Orquestador principal. Hemos envuelto la lógica en un try/except global que sólo
-    activará el fail-safe cuando ocurra una excepción crítica no manejada en el
-    pipeline. El fail-safe intentará devolver lo que ya esté procesado (partials),
-    y solo como ÚLTIMO RECURSO ejecutará una quick_degraded_pipeline si no hay nada.
-    """
     engines_order = ["gsearch", "ddg", "searx", "scrape"]
 
     site_filters = "site:.es OR site:.com"
@@ -2632,359 +1884,198 @@ def get_domains_from_prompt(prompt: str,
         return []
 
     desired = int(max_domains)
-    # variables principales que el fail-safe leerá si ocurre un fallo crítico:
     domains: List[Dict] = []
     seen = LRUSet(SEEN_MAX_SIZE)
     maybe_candidates: Dict[str, Dict] = {}
     logging.info("Starting domain search: desired=%d QUALITY_TARGET=%d", desired, QUALITY_TARGET)
 
-    # Variables que se rellenan durante ejecución y que queremos intentar recuperar en caso de fallo
     cycle = 0
     local_per_engine = per_engine
     fallback_thresholds = list(range(QUALITY_TARGET, QUALITY_ACCEPT - 1, -5))
 
-    # Estructuras auxiliares que se rellenan en bucles
-    candidate_urls = []
-    futures = {}
-    accepted_this_cycle = []
+    while len(domains) < desired and cycle < MAX_CYCLES:
+        cycle += 1
+        remaining = desired - len(domains)
+        fetch_per_engine = min(int(local_per_engine * OVERSHOOT_FACTOR), 300)
+        logging.info("Cycle %d - need %d more (fetch_per_engine=%d)", cycle, remaining, fetch_per_engine)
 
-    try:
-        while len(domains) < desired and cycle < MAX_CYCLES:
-            cycle += 1
-            remaining = desired - len(domains)
-            fetch_per_engine = min(int(local_per_engine * OVERSHOOT_FACTOR), 300)
-            logging.info("Cycle %d - need %d more (fetch_per_engine=%d)", cycle, remaining, fetch_per_engine)
-
-            candidate_urls = []
-            for qi, q in enumerate(queries, start=1):
-                logging.debug("Query [%d/%d]: %s", qi, len(queries), q)
-                time.sleep(random.uniform(*JITTER_BETWEEN_QUERIES))
-                try:
-                    urls = retry_with_backoff(search_with_fallback, q, max_results=fetch_per_engine, retries=2, backoff_base=1.8, country=None, preferred_order=engines_order)
-                    if not isinstance(urls, (list, tuple)):
-                        try:
-                            urls = list(urls)
-                        except Exception:
-                            urls = [urls] if urls else []
-                    flat_urls = []
-                    for it in urls:
-                        flat_urls.extend(safe_extract_urls(it))
-                    urls = flat_urls
+        candidate_urls = []
+        for qi, q in enumerate(queries, start=1):
+            logging.debug("Query [%d/%d]: %s", qi, len(queries), q)
+            time.sleep(random.uniform(*JITTER_BETWEEN_QUERIES))
+            try:
+                urls = retry_with_backoff(search_with_fallback, q, max_results=fetch_per_engine, retries=2, backoff_base=1.8, country=None, preferred_order=engines_order)
+                if not isinstance(urls, (list, tuple)):
                     try:
-                        del flat_urls
+                        urls = list(urls)
                     except Exception:
-                        pass
-                except Exception as e:
-                    logging.debug("Unified search failed for query %s: %s", q, e)
-                    urls = []
-                logging.debug(" -> unified search returned %d urls", len(urls))
-                if urls:
-                    candidate_urls.extend([(u, "unified") for u in urls])
+                        urls = [urls] if urls else []
+                flat_urls = []
+                for it in urls:
+                    flat_urls.extend(safe_extract_urls(it))
+                urls = flat_urls
+            except Exception as e:
+                logging.debug("Unified search failed for query %s: %s", q, e)
+                urls = []
+            logging.debug(" -> unified search returned %d urls", len(urls))
+            if urls:
+                candidate_urls.extend([(u, "unified") for u in urls])
+
+        random.shuffle(candidate_urls)
+        logging.info("Collected candidate_urls count=%d", len(candidate_urls))
+
+        if is_overloaded():
+            logging.warning("Backpressure detected (pending >= %d). Will perform short re-checks before degrading.", BACKPRESSURE_MAX_PENDING)
+            recheck_ok = False
+            for attempt in range(BACKPRESSURE_CHECK_RETRIES):
+                time.sleep(BACKPRESSURE_CHECK_SLEEP * (1 + random.random() * 0.5))
+                if not is_overloaded():
+                    recheck_ok = True
+                    logging.info("Backpressure cleared on re-check %d", attempt + 1)
+                    break
+                logging.info("Backpressure still present on re-check %d/%d", attempt + 1, BACKPRESSURE_CHECK_RETRIES)
+            if not recheck_ok:
+                logging.warning("Switching to degraded pipeline after %d failed re-checks", BACKPRESSURE_CHECK_RETRIES)
+                deg_domains = quick_degraded_pipeline(queries, remaining, prompt, keywords, intent, validate)
+                for item in deg_domains:
+                    key = canonical_domain_key_from_url(item.get("domain", ""), prefer_root=True) or item.get("domain")
+                    if key not in seen:
+                        seen.add(key)
+                        domains.append(item)
+                logging.info("Degraded pipeline returned %d domains (requested remaining=%d)", len(deg_domains), remaining)
+                final = domains[:desired]
+                if len(final) < desired:
+                    logging.warning("Degraded: could not reach requested count (%d) - returning %d", desired, len(final))
+                return final
+
+        futures = {}
+        accepted_this_cycle = []
+
+        for (u, src) in candidate_urls:
+            if len(domains) + len(accepted_this_cycle) >= desired:
+                break
+            try:
+                cand = sanitize_url_candidate(u) or u
+                key = canonical_domain_key_from_url(cand, prefer_root=True)
+                if not key or key in seen:
+                    continue
+                dom = key  # canonical root representation used throughout
+                if any(dom.endswith(s) for s in SOCIAL_BLACKLIST):
+                    continue
+                if domain_is_dynamic_blacklisted(dom):
+                    continue
+                if validate:
+                    try:
+                        if not domain_alive(dom):
+                            domain_mark_rejected(dom)
+                            continue
+                    except Exception:
+                        continue
+                root = dom
+                if root in TRUSTED_WHITELIST or dom in TRUSTED_WHITELIST:
+                    seen.add(key)
+                    accepted_this_cycle.append({"domain": dom, "quality": 100, "reasons": ["Whitelisted"], "source_engine": src})
+                    time.sleep(random.uniform(*JITTER_BETWEEN_PAGES))
+                    continue
+                score, reasons, verdict = fast_filter(prompt, dom, keywords)
+                logging.debug("fast_filter %s -> %s (%d) %s", dom, verdict, score, (reasons[:2] if reasons else []))
+                if verdict == "accept" and score >= QUALITY_TARGET:
+                    seen.add(key)
+                    accepted_this_cycle.append({"domain": dom, "quality": score, "reasons": reasons + [f"fast:{score}"], "source_engine": src})
+                    continue
+                if verdict == "reject":
+                    domain_mark_rejected(dom)
+                    continue
+                if dom not in futures and dom not in maybe_candidates:
+                    budget = _get_domain_retry_budget(dom)
+                    if budget <= 0:
+                        logging.debug("Skipping domain %s due to exhausted retry budget", dom)
+                        try:
+                            domain_mark_rejected(dom)
+                        except Exception:
+                            pass
+                        continue
+                    _ensure_domain_budget(dom)
+                    future = _executor.submit(heavy_check, prompt, dom, keywords)
+                    futures[future] = (dom, src)
+            except Exception as e:
+                logging.debug("candidate processing error: %s", e)
+                continue
+
+        for future, (dom, src) in list(futures.items()):
+            try:
+                res = future.result(timeout=HEAVY_TIMEOUT_SECS)
+                verdict = res.get("verdict")
+                score = int(res.get("score", 0))
+                reasons = res.get("reasons", [])
+                if score >= QUALITY_TARGET:
+                    key = canonical_domain_key_from_url(dom, prefer_root=True) or dom
+                    if key not in seen:
+                        seen.add(key)
+                        accepted_this_cycle.append({"domain": dom, "quality": score, "reasons": reasons + [f"heavy:{score}"], "source_engine": src})
+                        logging.info(" + heavy accepted %s (score=%d)", dom, score)
+                else:
+                    maybe_candidates[dom] = {"domain": dom, "quality": score, "reasons": reasons + [f"heavy:{score}"], "source_engine": src}
+                time.sleep(random.uniform(*JITTER_BETWEEN_PAGES))
+            except concurrent.futures.TimeoutError:
+                logging.info("heavy_check timeout for %s", dom)
                 try:
-                    del urls
+                    future.cancel()
                 except Exception:
                     pass
-
-            random.shuffle(candidate_urls)
-            logging.info("Collected candidate_urls count=%d", len(candidate_urls))
-
-            if is_overloaded():
-                logging.warning("Backpressure detected (pending >= %d). Will perform short re-checks before degrading.", BACKPRESSURE_MAX_PENDING)
-                recheck_ok = False
-                for attempt in range(BACKPRESSURE_CHECK_RETRIES):
-                    time.sleep(BACKPRESSURE_CHECK_SLEEP * (1 + random.random() * 0.5))
-                    if not is_overloaded():
-                        recheck_ok = True
-                        logging.info("Backpressure cleared on re-check %d", attempt + 1)
-                        break
-                    logging.info("Backpressure still present on re-check %d/%d", attempt + 1, BACKPRESSURE_CHECK_RETRIES)
-                if not recheck_ok:
-                    logging.warning("Switching to degraded pipeline after %d failed re-checks", BACKPRESSURE_CHECK_RETRIES)
-                    deg_domains = quick_degraded_pipeline(queries, remaining, prompt, keywords, intent, validate)
-                    for item in deg_domains:
-                        key = canonical_domain_key_from_url(item.get("domain", ""), prefer_root=True) or item.get("domain")
-                        if key not in seen:
-                            seen.add(key)
-                            domains.append(item)
-                    logging.info("Degraded pipeline returned %d domains (requested remaining=%d)", len(deg_domains), remaining)
-                    final = domains[:desired]
-                    if len(final) < desired:
-                        logging.warning("Degraded: could not reach requested count (%d) - returning %d", desired, len(final))
-                    return final
-
-            futures = {}
-            accepted_this_cycle = []
-
-            for (u, src) in candidate_urls:
-                if len(domains) + len(accepted_this_cycle) >= desired:
-                    break
                 try:
-                    cand = sanitize_url_candidate(u) or u
-                    key = canonical_domain_key_from_url(cand, prefer_root=True)
-                    if not key or key in seen:
-                        continue
-                    dom = key
-                    # Skip if domain circuit is open
-                    try:
-                        if not domain_is_available_for_checks(dom):
-                            logging.info("Skipping domain %s because domain circuit is open", dom)
-                            continue
-                    except Exception:
-                        pass
-                    if any(dom.endswith(s) for s in SOCIAL_BLACKLIST):
-                        continue
-                    if domain_is_dynamic_blacklisted(dom):
-                        continue
-                    if validate:
-                        try:
-                            if not domain_alive(dom):
-                                # domain_alive already marks failure; also mark rejected (existing behavior)
-                                domain_mark_rejected(dom)
-                                continue
-                        except Exception:
-                            continue
-                    root = dom
-                    if root in TRUSTED_WHITELIST or dom in TRUSTED_WHITELIST:
-                        seen.add(key)
-                        accepted_this_cycle.append({"domain": dom, "quality": 100, "reasons": ["Whitelisted"], "source_engine": src})
-                        time.sleep(random.uniform(*JITTER_BETWEEN_PAGES))
-                        continue
-                    score, reasons, verdict = fast_filter(prompt, dom, keywords)
-                    logging.debug("fast_filter %s -> %s (%d) %s", dom, verdict, score, (reasons[:2] if reasons else []))
-                    if verdict == "accept" and score >= QUALITY_TARGET:
-                        seen.add(key)
-                        accepted_this_cycle.append({"domain": dom, "quality": score, "reasons": reasons + [f"fast:{score}"], "source_engine": src})
-                        continue
-                    if verdict == "reject":
-                        domain_mark_rejected(dom)
-                        continue
-                    if dom not in futures and dom not in maybe_candidates:
-                        budget = _get_domain_retry_budget(dom)
-                        if budget <= 0:
-                            logging.debug("Skipping domain %s due to exhausted retry budget", dom)
-                            try:
-                                domain_mark_rejected(dom)
-                            except Exception:
-                                pass
-                            continue
-                        _ensure_domain_budget(dom)
-
-                        # ---------- HEAD-GATE (estricto) antes de encolar heavy_check ----------
-                        # Ejecutar domain_alive_short() antes de encolar cualquier GET pesado.
-                        # Si falla -> no encolamos heavy_check (bajamos prioridad / penalizamos).
-                        try:
-                            head_ok = False
-                            try:
-                                head_ok = domain_alive_short(dom)
-                            except Exception:
-                                head_ok = False
-                            if not head_ok:
-                                logging.info("HEAD-gate failed for %s — skipping heavy_check and penalizing slightly", dom)
-                                try:
-                                    _decrement_domain_retry_budget(dom)
-                                except Exception:
-                                    pass
-                                # Guardamos como candidato de baja calidad en maybe_candidates (no encolamos)
-                                maybe_candidates[dom] = {"domain": dom, "quality": 15, "reasons": ["head-gate-failed"], "source_engine": src}
-                                continue
-                        except Exception:
-                            logging.debug("Error running HEAD-gate for %s; proceeding cautiously", dom)
-
-                        # Submit heavy_check that is now safe/timeboxed internally (returns quickly even si subtasks timeout)
-                        future = _executor.submit(heavy_check, prompt, dom, keywords)
-                        futures[future] = (dom, src)
-                except Exception as e:
-                    logging.debug("candidate processing error: %s", e)
-                    continue
-
-            for future, (dom, src) in list(futures.items()):
-                try:
-                    # heavy_check es diseñado para terminar dentro de HEAVY_TIMEOUT_SECS; guardia extra aquí
-                    res = future.result(timeout=max(HEAVY_TIMEOUT_SECS, 6))
-                    verdict = res.get("verdict")
-                    score = int(res.get("score", 0))
-                    reasons = res.get("reasons", [])
-                    # If heavy_check reported no subtasksSucceeded -> mark failure for domain (circuit bookkeeping)
-                    try:
-                        if any("No subtasks succeeded" in r for r in reasons):
-                            _domain_mark_failure(dom, err="heavy_no_subtasks")
-                        else:
-                            # If score good or head ok, mark success (reset counters)
-                            if score >= QUALITY_ACCEPT or any("head-gate OK" in r for r in reasons) or any("fetched homepage text" in r for r in reasons):
-                                _domain_mark_success(dom)
-                    except Exception:
-                        pass
-
-                    if score >= QUALITY_TARGET:
-                        key = canonical_domain_key_from_url(dom, prefer_root=True) or dom
-                        if key not in seen:
-                            seen.add(key)
-                            accepted_this_cycle.append({"domain": dom, "quality": score, "reasons": reasons + [f"heavy:{score}"], "source_engine": src})
-                            logging.info(" + heavy accepted %s (score=%d)", dom, score)
-                    else:
-                        maybe_candidates[dom] = {"domain": dom, "quality": score, "reasons": reasons + [f"heavy:{score}"], "source_engine": src}
-                    time.sleep(random.uniform(*JITTER_BETWEEN_PAGES))
-                except concurrent.futures.TimeoutError:
-                    logging.info("heavy_check hard timeout for %s", dom)
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                    # Si heavy_check no respondió (esto es raro porque ahora controla subtasks), decrementamos un nivel pero con prudencia:
-                    try:
-                        remaining_budget = _decrement_domain_retry_budget(dom)
-                        logging.debug("Decremented retry budget for %s -> %d", dom, remaining_budget)
-                    except Exception:
-                        logging.debug("Failed to decrement retry budget for %s after timeout", dom)
-                    try:
-                        _domain_mark_failure(dom, err="heavy_timeout")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logging.debug("heavy_check error for %s: %s", dom, e)
-                    try:
-                        _decrement_domain_retry_budget(dom)
-                    except Exception:
-                        logging.debug("Failed to decrement retry budget for %s after exception", dom)
-                    try:
-                        _domain_mark_failure(dom, err=repr(e))
-                    except Exception:
-                        pass
-
-            accepted_this_cycle_sorted = sorted(accepted_this_cycle, key=lambda x: x.get("quality", 0), reverse=True)
-            for item in accepted_this_cycle_sorted:
-                if len(domains) >= desired:
-                    break
-                domains.append(item)
-
-            logging.info("Cycle %d done: accepted so far = %d / %d", cycle, len(domains), desired)
-            if len(domains) < desired:
-                local_per_engine = min(local_per_engine + 10, 1000)
-                logging.info("Not enough accepted; increasing per_engine to %d and continuing", local_per_engine)
-                time.sleep(min(1 + cycle, 6))
-
-        if len(domains) < desired and maybe_candidates:
-            logging.info("Attempting fallback relaxation to fill requested domains (desired=%d current=%d)", desired, len(domains))
-            sorted_maybe = sorted(maybe_candidates.values(), key=lambda x: x.get("quality", 0), reverse=True)
-            for thr in fallback_thresholds:
-                if len(domains) >= desired:
-                    break
-                for cand in sorted_maybe:
-                    if len(domains) >= desired:
-                        break
-                    key = canonical_domain_key_from_url(cand.get("domain", ""), prefer_root=True) or cand.get("domain")
-                    if cand["quality"] >= thr and key not in seen:
-                        seen.add(key)
-                        domains.append(cand)
-                logging.info("After relaxing to %d -> total accepted = %d", thr, len(domains))
-
-        if len(domains) < desired:
-            logging.warning("Final fallback: not enough high-quality domains; filling with best available to reach %d results", desired)
-            pool = {d["domain"]: d for d in list(maybe_candidates.values()) + domains}
-            sorted_pool = sorted(pool.values(), key=lambda x: x.get("quality", 0), reverse=True)
-            for item in sorted_pool:
-                if len(domains) >= desired:
-                    break
-                if item["domain"] in [d["domain"] for d in domains]:
-                    continue
-                domains.append(item)
-
-        final = domains[:desired]
-        if len(final) < desired:
-            logging.warning("Could not reach requested count (%d) - returning %d", desired, len(final))
-        _maybe_collect()
-        return final
-
-    except Exception as e:
-        # -------- FAIL-SAFE: ÚNICO Y ÚLTIMO RECURSO ----------
-        # Solo se activa cuando ocurre una excepción crítica no manejada
-        logging.exception("Critical error inside get_domains_from_prompt; activating fail-safe and returning partial results: %s", e)
-
-        partials: List[Dict] = []
-        try:
-            if isinstance(domains, list) and domains:
-                partials.extend(domains)
-        except Exception:
-            pass
-        try:
-            mc = (maybe_candidates or {})
-            if isinstance(mc, dict) and mc:
-                partials.extend(list(mc.values()))
-        except Exception:
-            pass
-        try:
-            atc = (accepted_this_cycle or [])
-            if isinstance(atc, list) and atc:
-                partials.extend(atc)
-        except Exception:
-            pass
-        try:
-            # intentar extraer información de futures si hay alguna que haya terminado
-            for fut, meta in list(futures.items()):
-                try:
-                    dom = None
-                    src = None
-                    if isinstance(meta, (list, tuple)) and len(meta) >= 1:
-                        dom = meta[0]
-                        src = meta[1] if len(meta) > 1 else None
-                    elif isinstance(meta, dict):
-                        dom = meta.get("domain")
-                        src = meta.get("source_engine")
-                    if dom:
-                        # si el futuro ya terminó, obtener resultado rápido
-                        if hasattr(fut, "done") and fut.done():
-                            try:
-                                res = fut.result(timeout=0)
-                                score = int(res.get("score", 0)) if isinstance(res, dict) else 0
-                                reasons = res.get("reasons", []) if isinstance(res, dict) else []
-                                partials.append({"domain": dom, "quality": score, "reasons": reasons + ["partial:future"], "source_engine": src or "future"})
-                            except Exception:
-                                partials.append({"domain": dom, "quality": 0, "reasons": ["partial:future-unavailable"], "source_engine": src or "future"})
-                        else:
-                            # futuro no terminado: devolver al menos el dominio con calidad 0
-                            partials.append({"domain": dom, "quality": 0, "reasons": ["partial:future-running"], "source_engine": src or "future"})
+                    _decrement_domain_retry_budget(dom)
                 except Exception:
-                    continue
-        except Exception:
-            pass
+                    logging.debug("Failed to decrement retry budget for %s after timeout", dom)
+            except Exception as e:
+                logging.debug("heavy_check error for %s: %s", dom, e)
+                try:
+                    _decrement_domain_retry_budget(dom)
+                except Exception:
+                    logging.debug("Failed to decrement retry budget for %s after exception", dom)
 
-        # Deduplicate by domain and preserve best quality first
-        seen_d = set()
-        uniq: List[Dict] = []
-        try:
-            partials_sorted = sorted([p for p in partials if isinstance(p, dict) and p.get("domain")], key=lambda x: x.get("quality", 0), reverse=True)
-            for it in partials_sorted:
-                dom = it.get("domain")
-                if not dom:
-                    continue
-                if dom in seen_d:
-                    continue
-                seen_d.add(dom)
-                uniq.append(it)
-        except Exception:
-            pass
+        accepted_this_cycle_sorted = sorted(accepted_this_cycle, key=lambda x: x.get("quality", 0), reverse=True)
+        for item in accepted_this_cycle_sorted:
+            if len(domains) >= desired:
+                break
+            domains.append(item)
 
-        # If still empty, try a last-resort degraded quick pipeline (no validate) — sólo si queries estaban presentes
-        if not uniq:
-            qs = locals().get("queries") or queries
-            try:
-                if qs:
-                    logging.warning("No partial results available: running last-resort degraded pipeline (fail-safe).")
-                    deg = quick_degraded_pipeline(qs, desired, prompt, keywords, intent, validate=False)
-                    if deg:
-                        # normalize deg output (they are dicts)
-                        for d in deg:
-                            if isinstance(d, dict) and d.get("domain"):
-                                key = canonical_domain_key_from_url(d.get("domain", ""), prefer_root=True) or d.get("domain")
-                                if key not in seen_d:
-                                    seen_d.add(key)
-                                    uniq.append(d)
-            except Exception:
-                logging.exception("Last-resort degraded pipeline also failed.")
+        logging.info("Cycle %d done: accepted so far = %d / %d", cycle, len(domains), desired)
+        if len(domains) < desired:
+            local_per_engine = min(local_per_engine + 10, 1000)
+            logging.info("Not enough accepted; increasing per_engine to %d and continuing", local_per_engine)
+            time.sleep(min(1 + cycle, 6))
 
-        logging.warning("get_domains_from_prompt fail-safe returning %d partial domains (requested %d).", len(uniq), desired)
-        _maybe_collect()
-        return uniq[:desired]
+    if len(domains) < desired and maybe_candidates:
+        logging.info("Attempting fallback relaxation to fill requested domains (desired=%d current=%d)", desired, len(domains))
+        sorted_maybe = sorted(maybe_candidates.values(), key=lambda x: x.get("quality", 0), reverse=True)
+        for thr in fallback_thresholds:
+            if len(domains) >= desired:
+                break
+            for cand in sorted_maybe:
+                if len(domains) >= desired:
+                    break
+                key = canonical_domain_key_from_url(cand.get("domain", ""), prefer_root=True) or cand.get("domain")
+                if cand["quality"] >= thr and key not in seen:
+                    seen.add(key)
+                    domains.append(cand)
+            logging.info("After relaxing to %d -> total accepted = %d", thr, len(domains))
+
+    if len(domains) < desired:
+        logging.warning("Final fallback: not enough high-quality domains; filling with best available to reach %d results", desired)
+        pool = {d["domain"]: d for d in list(maybe_candidates.values()) + domains}
+        sorted_pool = sorted(pool.values(), key=lambda x: x.get("quality", 0), reverse=True)
+        for item in sorted_pool:
+            if len(domains) >= desired:
+                break
+            if item["domain"] in [d["domain"] for d in domains]:
+                continue
+            domains.append(item)
+
+    final = domains[:desired]
+    if len(final) < desired:
+        logging.warning("Could not reach requested count (%d) - returning %d", desired, len(final))
+    return final
 
 # ---------------- Flask UI ----------------
 TEMPLATE = """<!doctype html>
@@ -3047,12 +2138,15 @@ def search_view():
     prompt_raw = request.form.get("prompt", "") or ""
     prompt = prompt_raw.strip()
 
+    # --- NUEVAS REGLAS DE SEGURIDAD / SANITIZACIÓN DEL PROMPT ---
     truncated_notice = False
+    # 1) Si el prompt excede PROMPT_MAX_CHARS lo recortamos (trim) para evitar cargas excesivas.
     if len(prompt) > PROMPT_MAX_CHARS:
         prompt = prompt[:PROMPT_MAX_CHARS]
         truncated_notice = True
         logging.info("Prompt trimmed from %d to %d chars", len(prompt_raw), PROMPT_MAX_CHARS)
 
+    # 2) Si hay 'palabras' absurdamente largas (> PROMPT_MAX_WORD) rechazamos la petición.
     giant_word_match = safe_search(r"\S{" + str(PROMPT_MAX_WORD + 1) + r",}", prompt_raw, max_len=PROMPT_MAX_CHARS*2)
     if giant_word_match:
         msg = f"Se rechazó el prompt: contiene una palabra demasiado larga (> {PROMPT_MAX_WORD} caracteres)."
@@ -3072,6 +2166,7 @@ def search_view():
 
     analysis = analyze_prompt(prompt)
     if truncated_notice:
+        # añadir aviso de truncado en el summary para que el usuario lo vea en la UI
         analysis["summary"] = (analysis.get("summary", "") + f" [TRUNCATED TO {PROMPT_MAX_CHARS} chars]")
     keywords = analysis.get("keywords")
     intent = analysis.get("intent")
@@ -3084,7 +2179,7 @@ def search_view():
         return render_template_string(TEMPLATE, dominios=None, error=f"Error en la búsqueda: {e}", per_engine=per_engine, max_domains=max_domains, validate=validate, warnings=None, analysis=analysis)
 
     if not dominios:
-        return render_template_string(TEMPLATE, dominios=None, error="No se encontraron dominios. Prueba a afinar el prompt.", per_engine=per_engine, max_domains=max_domains, validate=validate, warnings=warnings, analysis=analysis)
+        return render_template_string(TEMPLATE, dominios=None, error="No se encontraron dominios. Prueba a afinar el prompt.", per_engine=per_engine, max_domains=max_domains, validate=validate, warnings=None, analysis=analysis)
 
     warnings = []
     for d in dominios:
@@ -3093,108 +2188,38 @@ def search_view():
     resp = render_template_string(TEMPLATE, dominios=dominios, error=None, per_engine=per_engine, max_domains=max_domains, validate=validate, warnings=warnings, analysis=analysis)
     response = Response(resp, mimetype="text/html")
     response.headers["X-RateLimit-Remaining"] = str(remaining)
-
-    # cleanup local big objects
-    try:
-        del dominios
-    except Exception:
-        pass
-    _maybe_collect()
-
     return response
 
-# ---------------- Delegación del scoring a scoring.py (si existe) ----------------
-# Esta sección permite mover toda la lógica de scoring a un archivo externo scoring.py.
-# Si scoring.py está presente y exporta las funciones esperadas, sobrescribimos las
-# implementaciones locales para delegar la puntuación. Si no existe, usamos las funciones
-# locales que ya están definidas (legacy) para mantener compatibilidad.
-#
-# Mejora añadida: wrappers seguros que llaman al scoring externo dentro de un hilo con timeout,
-# validan tipos de retorno, y en caso de timeout/excepción vuelven a las implementaciones locales.
-try:
-    # Guardamos referencias a las implementaciones locales por si necesitamos fallback
-    _local_fast_filter = fast_filter
-    _local_heavy_check = heavy_check
-    _local_assess_domain_quality_quick = assess_domain_quality_quick
-    _local_tfidf_similarity = tfidf_similarity
-    _local_get_domain_age_months = get_domain_age_months
-
-    import scoring as scoring_mod  # <- espera un archivo scoring.py junto al main.py
-
-    logging.info("External scoring module 'scoring.py' found — attempting to delegate scoring functions to it.")
-
-    def _wrap_external_fn(fn_name: str, local_impl, timeout: Optional[float] = None, expect_type: Optional[type] = None):
-        """
-        Devuelve una función que llama a scoring_mod.<fn_name> si existe, con protección:
-         - ejecución en hilo (executor) con timeout opcional
-         - captura de excepciones y fallback a local_impl
-         - validación básica del tipo de retorno si expect_type se proporciona
-        """
-        fn_ext = getattr(scoring_mod, fn_name, None)
-        if not callable(fn_ext):
-            logging.debug("scoring.py does not provide %s, using local implementation.", fn_name)
-            return local_impl
-
-        def wrapper(*args, **kwargs):
-            try:
-                if timeout and timeout > 0:
-                    fut = _executor.submit(fn_ext, *args, **kwargs)
-                    try:
-                        res = fut.result(timeout=timeout)
-                    except concurrent.futures.TimeoutError:
-                        try:
-                            fut.cancel()
-                        except Exception:
-                            pass
-                        logging.warning("External scoring.%s timed out after %.2fs — falling back to local implementation.", fn_name, timeout)
-                        return local_impl(*args, **kwargs)
-                else:
-                    res = fn_ext(*args, **kwargs)
-                # Basic validation of return type when requested
-                if expect_type and not isinstance(res, expect_type):
-                    logging.warning("External scoring.%s returned unexpected type %s (expected %s) — using local implementation.", fn_name, type(res), expect_type)
-                    return local_impl(*args, **kwargs)
-                return res
-            except Exception as e:
-                logging.exception("External scoring.%s raised exception: %s — falling back to local implementation.", fn_name, e)
-                try:
-                    return local_impl(*args, **kwargs)
-                except Exception:
-                    logging.exception("Local fallback for %s also failed.", fn_name)
-                    # ultimate fallback: try best-effort return based on expected_type
-                    if fn_name == "fast_filter":
-                        return (0, ["fallback-error"], "reject")
-                    if fn_name == "heavy_check":
-                        return {"score": 0, "reasons": ["fallback-error"], "verdict": "reject", "elapsed": 0.0}
-                    if fn_name == "assess_domain_quality_quick":
-                        return (0, ["fallback-error"])
-                    if fn_name == "tfidf_similarity":
-                        return 0.0
-                    if fn_name == "get_domain_age_months":
-                        return None
-                    return None
-        return wrapper
-
-    # Create wrapped functions with reasonable per-call timeouts
-    fast_filter = _wrap_external_fn("fast_filter", _local_fast_filter, timeout=2.5, expect_type=tuple)
-    heavy_check = _wrap_external_fn("heavy_check", _local_heavy_check, timeout=max(HEAVY_TIMEOUT_SECS, 6), expect_type=dict)
-    assess_domain_quality_quick = _wrap_external_fn("assess_domain_quality_quick", _local_assess_domain_quality_quick, timeout=SUBTASK_TIMEOUTS.get("assess_quick", 6), expect_type=tuple)
-    tfidf_similarity = _wrap_external_fn("tfidf_similarity", _local_tfidf_similarity, timeout=1.5, expect_type=float)
-    get_domain_age_months = _wrap_external_fn("get_domain_age_months", _local_get_domain_age_months, timeout=4.0, expect_type=(int, type(None)))
-
-    logging.info("Delegation to scoring.py completed (wrapped).")
-except Exception as e:
-    logging.info("No external scoring module detected or import failed; using local legacy scoring implementations. (%s)", e)
-
 # ---------------- Entrypoint / helpers ----------------
+def retry_with_backoff(fn, *args, retries=2, backoff_base=2.0, max_backoff=MAX_BACKOFF, **kwargs):
+    attempt = 0
+    backoff = backoff_base
+    while True:
+        attempt += 1
+        try:
+            return fn(*args, **kwargs)
+        except requests.exceptions.RequestException as e:
+            logging.debug("Request exception: %s", e)
+            if attempt > retries:
+                raise
+            wait = min(backoff, max_backoff)
+            logging.info("Transient error, retrying in %.1f s (attempt %d/%d)", wait, attempt, retries)
+            time.sleep(wait)
+            backoff *= backoff_base
+        except Exception as e:
+            logging.debug("Non-requests error: %s", e)
+            if attempt > retries:
+                raise
+            wait = min(backoff, max_backoff)
+            logging.info("Error, retrying in %.1f s (attempt %d/%d)", wait, attempt, retries)
+            time.sleep(wait)
+            backoff *= backoff_base
+
 if __name__ == "__main__":
     logging.info("Starting Domain Finder (QUALITY_TARGET=%d) on port %d", QUALITY_TARGET, PORT)
     logging.info("Engine circuit-breaker config: ENGINE_MAX_FAILURES=%d ENGINE_COOLDOWN_SECONDS=%d ENGINE_ATTEMPTS_PER_ENGINE=%d ALLOW_SCRAPE_GOOGLE=%s",
                  ENGINE_MAX_FAILURES, ENGINE_COOLDOWN_SECONDS, ENGINE_ATTEMPTS_PER_ENGINE, ALLOW_SCRAPE_GOOGLE)
     logging.info("Politeness config: PER_DOMAIN_DELAY_BASE=%.2f PER_DOMAIN_DELAY_JITTER=%.2f PER_DOMAIN_CONCURRENCY=%d",
                  PER_DOMAIN_DELAY_BASE, PER_DOMAIN_DELAY_JITTER, PER_DOMAIN_CONCURRENCY)
-    logging.info("Domain circuit-breaker config: DOMAIN_MAX_FAILURES_BEFORE_TRIP=%d DOMAIN_COOLDOWN_SECONDS=%d",
-                 DOMAIN_MAX_FAILURES_BEFORE_TRIP, DOMAIN_COOLDOWN_SECONDS)
     logging.info("Backpressure config: BACKPRESSURE_MAX_PENDING=%d BACKPRESSURE_CHECK_RETRIES=%d", BACKPRESSURE_MAX_PENDING, BACKPRESSURE_CHECK_RETRIES)
-    # Usar Flask dev server solo para pruebas locales - en producción usa gunicorn
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    app.run(host="0.0.0.0", port=PORT)
